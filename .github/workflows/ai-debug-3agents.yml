@@ -64,6 +64,7 @@ jobs:
           test -f ".ai/contract.md"
           test -f ".ai/scripts/live_preflight.py"
           test -f ".ai/scripts/openai_call.py"
+          test -f ".ai/scripts/read_role_config.py"
 
       - name: "Prepare output dirs"
         shell: bash
@@ -320,14 +321,8 @@ jobs:
 
           test -f output/preflight/openai.config.json
 
-          python3 -c "import json; cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8')); \
-r=cfg['roles']['arch']; print(r['model']);" > /tmp/model.txt
-
-          python3 -c "import json; cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8')); \
-r=cfg['roles']['arch']; print(int(r['max_output_tokens']));" > /tmp/mout.txt
-
-          MODEL="$(cat /tmp/model.txt)"
-          MOUT="$(cat /tmp/mout.txt)"
+          MODEL="$(python3 .ai/scripts/read_role_config.py --cfg output/preflight/openai.config.json --role arch --field model)"
+          MOUT="$(python3 .ai/scripts/read_role_config.py --cfg output/preflight/openai.config.json --role arch --field max_output_tokens)"
 
           TITLE="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('title',''))")"
           BODY="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('body',''))")"
