@@ -63,6 +63,7 @@ jobs:
           set -euo pipefail
           test -f ".ai/contract.md"
           test -f ".ai/scripts/live_preflight.py"
+          test -f ".ai/scripts/openai_call.py"
 
       - name: "Prepare output dirs"
         shell: bash
@@ -133,6 +134,14 @@ jobs:
                -H "Accept: application/vnd.github+json" \
                "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE/comments?per_page=100" \
             > "${OUTPUT_DIR}/context/comments.json"
+
+      - name: "Snapshot OpenAI config into preflight artifact (if present)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ".ai/openai.config.json" ]; then
+            cp ".ai/openai.config.json" "${OUTPUT_DIR}/preflight/openai.config.json"
+          fi
 
       - name: "LIVE gate + budget preflight (no OpenAI calls)"
         id: live_gate
@@ -296,18 +305,44 @@ jobs:
           name: ai-debug-context
           path: output/context
 
-      - name: "Generate ARCH live placeholder (no OpenAI yet)"
+      - name: "Download preflight artifact (includes openai.config snapshot)"
+        uses: actions/download-artifact@v4
+        with:
+          name: preflight-out
+          path: output/preflight
+
+      - name: "Run ARCH (OpenAI Responses API)"
         shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
+
+          test -f output/preflight/openai.config.json
+
+          python3 -c "import json; cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8')); \
+r=cfg['roles']['arch']; print(r['model']);" > /tmp/model.txt
+
+          python3 -c "import json; cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8')); \
+r=cfg['roles']['arch']; print(int(r['max_output_tokens']));" > /tmp/mout.txt
+
+          MODEL="$(cat /tmp/model.txt)"
+          MOUT="$(cat /tmp/mout.txt)"
+
+          TITLE="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('title',''))")"
+          BODY="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('body',''))")"
+          URL="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('html_url',''))")"
+
+          SYS="You are ARCH. Produce a crisp implementation plan in Markdown. No code. Output must be deterministic-style: bullet steps, assumptions, risks, tests."
+          USR="Context:\nURL: ${URL}\n\nTitle:\n${TITLE}\n\nBody:\n${BODY}\n\nTask:\nWrite ARCH plan for next changes in this repo. Keep it short and actionable."
+
           mkdir -p output/live/arch
-          ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
-          {
-            echo "# ARCH (placeholder)"
-            echo ""
-            echo "Issue: $ISSUE_NUM"
-            echo "Note: LIVE enabled, but OpenAI calls not implemented in this step."
-          } > output/live/arch/arch.md
+          python3 .ai/scripts/openai_call.py \
+            --model "$MODEL" \
+            --max_output_tokens "$MOUT" \
+            --system "$SYS" \
+            --user "$USR" \
+            --out_dir output/live/arch
 
       - name: "Upload LIVE ARCH artifact"
         uses: actions/upload-artifact@v4
@@ -337,7 +372,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p output/live/dev
-          ISSUE_NUM="$(jq -r '.number // ""' output/context/issue.json 2>/dev/null || true)"
+          ISSUE_NUM="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('number',''))")"
           if [ -z "$ISSUE_NUM" ]; then
             ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
           fi
@@ -346,7 +381,7 @@ jobs:
             echo ""
             echo "Issue: $ISSUE_NUM"
             echo "Input: output/live/arch/arch.md"
-            echo "Note: LIVE enabled, but OpenAI calls not implemented in this step."
+            echo "Note: DEV OpenAI calls not implemented yet."
           } > output/live/dev/dev.md
 
           {
@@ -384,8 +419,8 @@ jobs:
           {
             echo "# QA LIVE report"
             echo ""
-            echo "PASS: placeholders exist and artifact-only chain works."
-            echo "Note: No OpenAI calls yet."
+            echo "PASS: artifact-only chain works."
+            echo "Note: DEV/QA OpenAI calls not implemented yet."
           } > output/live/qa/report.md
 
       - name: "Upload LIVE QA artifact"
