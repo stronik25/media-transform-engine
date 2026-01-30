@@ -45,6 +45,9 @@ env:
   OUTPUT_DIR: output
   BRANCH_PREFIX: ai-debug/issue-
   LIVE_BRANCH_PREFIX: ai-live/issue-
+  # IMPORTANT: read once at workflow scope.
+  # Must be defined as a Repository Variable in: Settings -> Secrets and variables -> Actions -> Variables
+  LIVE_ENABLED: ${{ vars.LIVE_ENABLED }}
 
 jobs:
   preflight:
@@ -164,7 +167,6 @@ jobs:
         id: live_gate
         shell: bash
         env:
-          LIVE_ENABLED: ${{ vars.LIVE_ENABLED }}
           INPUT_RUN_LIVE: ${{ inputs.run_live }}
           INPUT_FAIL_ON: ${{ inputs.fail_on_budget_exceed }}
           INPUT_MAX_USD: ${{ inputs.max_usd }}
@@ -178,6 +180,7 @@ jobs:
           MAX_USD="${INPUT_MAX_USD}"
           MAX_IN_TOK="${INPUT_MAX_IN_TOK}"
           MAX_OUT_TOK="${INPUT_MAX_OUT_TOK}"
+
           LIVE_ON="${LIVE_ENABLED:-false}"
           CFG=".ai/openai.config.json"
 
@@ -476,7 +479,6 @@ jobs:
           test -n "$ISSUE_MD"
           test -f output/live/dev/response.json
 
-          # Strict structure checks (case-insensitive)
           grep -qiE '^##[[:space:]]+Summary[[:space:]]*$' "$ISSUE_MD"
           grep -qiE '^##[[:space:]]+Proposed changes[[:space:]]*$' "$ISSUE_MD"
           grep -qiE '^##[[:space:]]+Files to touch[[:space:]]*$' "$ISSUE_MD"
