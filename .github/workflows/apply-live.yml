@@ -1,0 +1,73 @@
+name: "Apply LIVE artifact -> PR (manual by run_id)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Workflow run id to pull artifacts from (number)"
+        required: true
+      issue:
+        description: "Issue number (e.g. 1)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+env:
+  LIVE_BRANCH_PREFIX: ai-live/issue-
+  ARTIFACT_NAME: live-dev
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Download LIVE DEV artifact from run_id"
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          run_id: ${{ inputs.run_id }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: output/live/dev
+
+      - name: "Apply artifact into repo (branch + PR)"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_NUM="${{ inputs.issue }}"
+          SRC="output/live/dev/issue_${ISSUE_NUM}.md"
+
+          if [ ! -f "$SRC" ]; then
+            echo "Missing expected file in artifact: $SRC" >&2
+            echo "Files present:" >&2
+            ls -la output/live/dev >&2 || true
+            exit 2
+          fi
+
+          mkdir -p .ai/dev
+          cp "$SRC" ".ai/dev/issue_${ISSUE_NUM}.md"
+
+          BR="${{ env.LIVE_BRANCH_PREFIX }}${ISSUE_NUM}-run-${{ inputs.run_id }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BR"
+          git add ".ai/dev/issue_${ISSUE_NUM}.md"
+          git commit -m "ai-live: apply artifact run ${{ inputs.run_id }} for issue #${ISSUE_NUM}" || true
+          git push -u origin "$BR" --force
+
+          TITLE="ai-live: issue #${ISSUE_NUM} (run ${{ inputs.run_id }})"
+          BODY="Applied LIVE DEV artifact into .ai/dev/issue_${ISSUE_NUM}.md.\n\nSource run_id: ${{ inputs.run_id }}\nArtifact: ${{ env.ARTIFACT_NAME }}\n\nSafety: manual apply workflow; no direct main writes."
+
+          gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
