@@ -1,4 +1,4 @@
-name: "AI Debug (v5: optional live gates; v4 deterministic stays default)"
+name: "AI Debug (v5 gates; v4 deterministic default)"
 
 on:
   workflow_dispatch:
@@ -138,14 +138,19 @@ jobs:
         shell: bash
         env:
           LIVE_ENABLED: ${{ vars.LIVE_ENABLED }}
+          INPUT_RUN_LIVE: ${{ inputs.run_live }}
+          INPUT_FAIL_ON: ${{ inputs.fail_on_budget_exceed }}
+          INPUT_MAX_USD: ${{ inputs.max_usd }}
+          INPUT_MAX_IN_TOK: ${{ inputs.max_input_tokens }}
+          INPUT_MAX_OUT_TOK: ${{ inputs.max_output_tokens_per_call }}
         run: |
           set -euo pipefail
 
-          RUN_LIVE="${{ inputs.run_live }}"
-          FAIL_ON="${{ inputs.fail_on_budget_exceed }}"
-          MAX_USD="${{ inputs.max_usd }}"
-          MAX_IN_TOK="${{ inputs.max_input_tokens }}"
-          MAX_OUT_TOK="${{ inputs.max_output_tokens_per_call }}"
+          RUN_LIVE="${INPUT_RUN_LIVE}"
+          FAIL_ON="${INPUT_FAIL_ON}"
+          MAX_USD="${INPUT_MAX_USD}"
+          MAX_IN_TOK="${INPUT_MAX_IN_TOK}"
+          MAX_OUT_TOK="${INPUT_MAX_OUT_TOK}"
           LIVE_ON="${LIVE_ENABLED:-false}"
           CFG=".ai/openai.config.json"
 
@@ -170,41 +175,41 @@ jobs:
             exit 3
           fi
 
-          # Validate config structure + numeric fields
-          python3 -c "import json,sys; p='.ai/openai.config.json'; cfg=json.load(open(p,'r',encoding='utf-8')); \
-roles=cfg.get('roles'); \
-assert isinstance(roles,dict), 'Config missing top-level key: roles'; \
-req=('arch','dev','qa'); keys=('model','price_in_per_1k','price_out_per_1k','max_output_tokens'); \
-for r in req: \
-  assert r in roles, f'Config missing role: {r}'; \
-  rr=roles[r]; \
-  for k in keys: assert k in rr, f\"Config role '{r}' missing key: {k}\"; \
-  float(rr['price_in_per_1k']); float(rr['price_out_per_1k']); int(rr['max_output_tokens']); \
-print('CONFIG_OK=1')" >/dev/null
-
-          # Enforce per-role output token cap <= workflow cap
-          python3 -c "import json; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); cap=int('${MAX_OUT_TOK}'); \
-roles=cfg['roles']; \
-for r in ('arch','dev','qa'): \
-  mout=int(roles[r]['max_output_tokens']); \
-  assert mout<=cap, f'Config role {r} max_output_tokens exceeds workflow cap: {mout} > {cap}'" >/dev/null
+          # Validate config structure + numeric fields (reads cap from ENV)
+          export MAX_OUT_TOK
+          python3 -c 'import json,os,sys
+cfg=json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
+roles=cfg.get("roles")
+if not isinstance(roles,dict): raise SystemExit("Config missing top-level key: roles")
+for role in ("arch","dev","qa"):
+  if role not in roles: raise SystemExit(f"Config missing role: {role}")
+  r=roles[role]
+  for k in ("model","price_in_per_1k","price_out_per_1k","max_output_tokens"):
+    if k not in r: raise SystemExit(f"Config role {role} missing key: {k}")
+  float(r["price_in_per_1k"]); float(r["price_out_per_1k"])
+  mout=int(r["max_output_tokens"])
+  cap=int(os.environ["MAX_OUT_TOK"])
+  if mout>cap: raise SystemExit(f"Config role {role} max_output_tokens exceeds cap: {mout} > {cap}")
+print("CONFIG_OK")' >/dev/null
 
           ISSUE_BYTES="$(wc -c < "${OUTPUT_DIR}/context/issue.json")"
           COMM_BYTES="$(wc -c < "${OUTPUT_DIR}/context/comments.json")"
           TOTAL_BYTES="$((ISSUE_BYTES + COMM_BYTES))"
 
-          # Conservative estimate: tokens ~= bytes/3, add overhead
           EST_IN_TOK="$((TOTAL_BYTES / 3 + 800))"
           EST_TOTAL_IN_TOK="$((EST_IN_TOK * 3))"
 
-          # Compute worst-case USD estimate and write to file
-          EST_TOTAL_USD="$(python3 -c "import json; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); roles=cfg['roles']; \
-est_in=int('${EST_IN_TOK}'); \
-def cost(role): \
-  r=roles[role]; pin=float(r['price_in_per_1k']); pout=float(r['price_out_per_1k']); mout=int(r['max_output_tokens']); \
-  return (est_in/1000.0)*pin + (mout/1000.0)*pout; \
-total=cost('arch')+cost('dev')+cost('qa'); \
-print(f'{total:.6f}')" )"
+          export EST_IN_TOK
+          EST_TOTAL_USD="$(python3 -c 'import json,os
+cfg=json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
+roles=cfg["roles"]
+est_in=int(os.environ["EST_IN_TOK"])
+def cost(role):
+  r=roles[role]
+  pin=float(r["price_in_per_1k"]); pout=float(r["price_out_per_1k"]); mout=int(r["max_output_tokens"])
+  return (est_in/1000.0)*pin + (mout/1000.0)*pout
+total=cost("arch")+cost("dev")+cost("qa")
+print(f"{total:.6f}")')"
 
           {
             echo "run_live_requested=$RUN_LIVE"
@@ -227,8 +232,11 @@ print(f'{total:.6f}')" )"
             echo "Budget fail: est_total_input_tokens ($EST_TOTAL_IN_TOK) > max_input_tokens ($MAX_IN_TOK)" >&2
           fi
 
-          python3 -c "from decimal import Decimal; est=Decimal('${EST_TOTAL_USD}'); mx=Decimal('${MAX_USD}'); \
-import sys; sys.exit(10 if est>mx else 0)" || {
+          python3 -c 'from decimal import Decimal; import os,sys
+est=Decimal(os.environ["EST_TOTAL_USD"])
+mx=Decimal(os.environ["MAX_USD"])
+sys.exit(10 if est>mx else 0)' \
+          EST_TOTAL_USD="$EST_TOTAL_USD" MAX_USD="$MAX_USD" || {
             EXCEED=1
             echo "Budget fail: est_total_usd ($EST_TOTAL_USD) > max_usd ($MAX_USD)" >&2
           }
