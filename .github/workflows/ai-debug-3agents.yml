@@ -1,157 +1,117 @@
-name: "AI Debug (3 agents: ARCH → DEV → QA)"
+name: AI Debug (3 agents: ARCH -> DEV -> QA)
 
 on:
   issues:
-    types: [labeled]
+    types: [opened, labeled, edited]
   workflow_dispatch:
     inputs:
       issue_number:
-        description: "Issue number to use as task (optional)"
+        description: "Issue number to use as task"
         required: false
-        default: "1"
-      dry_run:
-        description: "If true: only validate environment (no LLM calls)"
-        required: true
-        default: "true"
+        default: ""
 
 permissions:
   contents: write
   pull-requests: write
   issues: write
 
-concurrency:
-  group: ai-debug-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   preflight:
-    name: preflight
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'debug')
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Validate repo structure
+      - name: Validate repo structure (clear errors)
         shell: bash
         run: |
           set -euo pipefail
-          test -f ".ai/contract.md"
-          test -f ".ai/allowlist.txt"
-          test -f ".ai/prompts/arch.md"
-          test -f ".ai/prompts/dev.md"
-          test -f ".ai/prompts/qa.md"
-          test -f "ci/accept.sh"
-          test -f "ci/guard_allowlist.sh"
-          test -f "ci/pack_context.sh"
-          test -f "ci/llm_call.sh"
-          test -f "ci/extract_message.py"
-          test -f "ci/apply_changes.py"
-          echo "OK: repo structure"
+          missing=0
 
-      - name: Validate secrets/vars presence (no echo)
-        env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          ARCH_MODEL: ${{ vars.ARCH_MODEL }}
-          DEV_MODEL: ${{ vars.DEV_MODEL }}
-          QA_MODEL: ${{ vars.QA_MODEL }}
-        shell: bash
-        run: |
-          set -euo pipefail
+          need_file() { if [ ! -f "$1" ]; then echo "::error::Missing required file: $1"; missing=1; fi; }
+          need_dir()  { if [ ! -d "$1" ]; then echo "::error::Missing required dir: $1";  missing=1; fi; }
 
-          [ -n "${LLM_ENDPOINT:-}" ] || (echo "Missing secret: LLM_ENDPOINT" && exit 2)
-          [ -n "${LLM_API_KEY:-}" ] || (echo "Missing secret: LLM_API_KEY" && exit 2)
-          [ -n "${ARCH_MODEL:-}" ]  || (echo "Missing variable: ARCH_MODEL" && exit 2)
-          [ -n "${DEV_MODEL:-}" ]   || (echo "Missing variable: DEV_MODEL" && exit 2)
-          [ -n "${QA_MODEL:-}" ]    || (echo "Missing variable: QA_MODEL" && exit 2)
+          need_dir "ci"
+          need_file "ci/llm_call.sh"
+          need_file "ci/pack_context.sh"
+          need_file "ci/extract_message.py"
+          need_file "ci/apply_changes.py"
+          need_file "ci/guard_allowlist.sh"
+          need_file "ci/accept.sh"
 
-          echo "OK: secrets/vars present"
+          need_dir ".ai"
+          need_file ".ai/contract.md"
+          need_file ".ai/allowlist.txt"
+          need_dir ".ai/prompts"
+          need_file ".ai/prompts/arch.md"
+          need_file ".ai/prompts/dev.md"
+          need_file ".ai/prompts/qa.md"
 
-      - name: Dry-run marker
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "DRY-RUN: preflight only. No LLM calls."
-          else
-            echo "LIVE or issue-trigger mode."
+          if [ "$missing" -eq 1 ]; then
+            echo "::error::Preflight failed: repo scaffolding is incomplete."
+            exit 1
           fi
 
+      - name: Validate secrets/vars presence (no echo)
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          ARCH_MODEL: ${{ vars.ARCH_MODEL }}
+          DEV_MODEL:  ${{ vars.DEV_MODEL }}
+          QA_MODEL:   ${{ vars.QA_MODEL }}
+        run: |
+          set -euo pipefail
+          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::Missing secret OPENAI_API_KEY"; exit 1; }
+          [ -n "${LLM_ENDPOINT:-}" ]   || { echo "::error::Missing secret LLM_ENDPOINT (https://api.openai.com/v1/responses)"; exit 1; }
+          [ -n "${ARCH_MODEL:-}" ]     || { echo "::error::Missing var ARCH_MODEL"; exit 1; }
+          [ -n "${DEV_MODEL:-}" ]      || { echo "::error::Missing var DEV_MODEL"; exit 1; }
+          [ -n "${QA_MODEL:-}" ]       || { echo "::error::Missing var QA_MODEL"; exit 1; }
+
   arch:
-    name: arch
     needs: preflight
-    runs-on: ubuntu-latest
     if: |
-      needs.preflight.result == 'success' &&
-      (
-        (github.event_name == 'workflow_dispatch' && inputs.dry_run != 'true') ||
-        (github.event_name == 'issues')
-      )
+      (github.event_name == 'issues' && github.event.label.name == 'ai-debug') ||
+      (github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install tools
-        shell: bash
         run: |
-          set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq gh
+          sudo apt-get install -y jq
 
       - name: Build context
-        shell: bash
         run: |
-          set -euo pipefail
           chmod +x ci/*.sh
           ci/pack_context.sh ci/context.md
 
-      - name: Resolve issue (supports workflow_dispatch)
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Resolve ISSUE_NUM
+        id: issue
         shell: bash
         run: |
           set -euo pipefail
-
-          ISSUE_NUM=""
-
           if [ "${{ github.event_name }}" = "issues" ]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
+            echo "num=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
           else
-            ISSUE_NUM="${{ inputs.issue_number }}"
-          fi
-
-          echo "ISSUE_NUM=$ISSUE_NUM" >> "$GITHUB_ENV"
-
-          if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "0" ]; then
-            gh api -H "Accept: application/vnd.github+json" \
-              "/repos/${{ github.repository }}/issues/${ISSUE_NUM}" \
-              > ci/issue.json
-          else
-            echo '{}' > ci/issue.json
+            echo "num=${{ inputs.issue_number }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build ARCH user prompt
         shell: bash
         run: |
           set -euo pipefail
-          TITLE="$(jq -r '.title // ""' ci/issue.json)"
-          BODY="$(jq -r '.body // ""' ci/issue.json)"
+          ISSUE_NUM="${{ steps.issue.outputs.num }}"
 
           {
             echo "TASK:"
-            if [ -n "${ISSUE_NUM:-}" ] && [ "${ISSUE_NUM}" != "0" ]; then
-              echo "Issue #: ${ISSUE_NUM}"
-              echo ""
+            if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "0" ]; then
+              echo "Issue title/body:"
               echo "### TITLE"
-              echo "$TITLE"
+              echo "${{ github.event.issue.title || '' }}"
               echo ""
               echo "### BODY"
-              echo "$BODY"
+              echo "${{ github.event.issue.body || '' }}"
             else
               echo "No issue provided. Use contract.md as the default goal."
             fi
@@ -163,9 +123,8 @@ jobs:
       - name: Call ARCH model
         env:
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LLM_MODEL: ${{ vars.ARCH_MODEL }}
-        shell: bash
         run: |
           set -euo pipefail
           chmod +x ci/llm_call.sh
@@ -180,19 +139,13 @@ jobs:
           path: ci/plan.json
 
   dev:
-    name: dev
     needs: arch
     runs-on: ubuntu-latest
-    if: needs.arch.result == 'success'
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install tools
-        shell: bash
         run: |
-          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
 
@@ -203,16 +156,12 @@ jobs:
           path: ci
 
       - name: Build context
-        shell: bash
         run: |
-          set -euo pipefail
           chmod +x ci/*.sh
           ci/pack_context.sh ci/context.md
 
       - name: Build DEV user prompt
-        shell: bash
         run: |
-          set -euo pipefail
           {
             echo "CONTRACT:"
             cat .ai/contract.md
@@ -230,9 +179,8 @@ jobs:
       - name: DEV attempt 1
         env:
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LLM_MODEL: ${{ vars.DEV_MODEL }}
-        shell: bash
         run: |
           set -euo pipefail
           chmod +x ci/llm_call.sh
@@ -241,13 +189,11 @@ jobs:
           python3 -m json.tool ci/changes.json > /dev/null
 
       - name: Apply changes
-        shell: bash
         run: |
           set -euo pipefail
           python3 ci/apply_changes.py ci/changes.json
 
       - name: Run guard + accept
-        shell: bash
         run: |
           set -euo pipefail
           chmod +x ci/guard_allowlist.sh ci/accept.sh
@@ -265,56 +211,75 @@ jobs:
             ci/accept.log
             output/**
 
-      - name: Create PR (only if checks passed)
+      - name: Create PR (only if checks passed and there are changes)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
           set -euo pipefail
+          if git diff --quiet; then
+            echo "No changes to commit; skipping PR."
+            exit 0
+          fi
 
           BR="ai/debug-${{ github.run_id }}"
           git config user.name "ai-bot"
           git config user.email "ai-bot@users.noreply.github.com"
           git checkout -b "$BR"
           git add -A
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit; skipping PR."
-            exit 0
-          fi
-
           git commit -m "AI debug fixes (run ${{ github.run_id }})"
           git push origin "$BR"
 
-          gh pr create \
+          PR_URL="$(gh pr create \
             --title "AI debug fixes (run ${{ github.run_id }})" \
-            --body "Generated by 3-agent workflow.\n\nArtifacts: dev-run" \
-            --base main --head "$BR"
+            --body "Generated by 3-agent workflow.\n\n- allowlist: PASS\n- accept: PASS\nArtifacts: dev-run" \
+            --base main --head "$BR")"
+
+          echo "$PR_URL" > ci/pr_url.txt
+
+      - name: Upload PR url (if created)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr
+          path: ci/pr_url.txt
 
   qa:
-    name: qa
     needs: dev
+    if: ${{ needs.dev.result == 'success' }}
     runs-on: ubuntu-latest
-    if: always()
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install tools
-        shell: bash
         run: |
-          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq gh
 
-      - name: Build QA user prompt (best-effort)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+      - name: Download dev artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dev-run
+          path: ci
+
+      - name: Download PR url (if exists)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pr
+          path: ci
+
+      - name: Build QA user prompt
         run: |
           set -euo pipefail
+          PR_URL=""
+          if [ -f ci/pr_url.txt ]; then PR_URL="$(cat ci/pr_url.txt)"; fi
+
+          DIFF_TXT="(no PR diff available)"
+          if [ -n "$PR_URL" ]; then
+            DIFF_TXT="$(gh pr diff "$PR_URL" || true)"
+          fi
+
           {
             echo "CONTRACT:"
             cat .ai/contract.md
@@ -322,19 +287,21 @@ jobs:
             echo "ALLOWLIST:"
             cat .ai/allowlist.txt
             echo ""
-            echo "DEV RESULT: ${{ needs.dev.result }}"
+            echo "DIFF:"
+            echo "$DIFF_TXT"
             echo ""
-            echo "NOTE:"
-            echo "QA here is advisory; main gating is ci/guard_allowlist.sh + ci/accept.sh in dev job."
+            echo "ALLOWLIST LOG:"
+            if [ -f ci/allowlist.log ]; then cat ci/allowlist.log; else echo "(missing)"; fi
+            echo ""
+            echo "ACCEPT LOG:"
+            if [ -f ci/accept.log ]; then cat ci/accept.log; else echo "(missing)"; fi
           } > ci/qa_user.md
 
-      - name: Call QA model (only if dev succeeded)
-        if: ${{ needs.dev.result == 'success' }}
+      - name: Call QA model
         env:
           LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LLM_MODEL: ${{ vars.QA_MODEL }}
-        shell: bash
         run: |
           set -euo pipefail
           chmod +x ci/llm_call.sh
@@ -342,9 +309,27 @@ jobs:
           python3 ci/extract_message.py ci/qa_raw.json ci/qa.json
           python3 -m json.tool ci/qa.json > /dev/null
 
-      - name: Upload QA report (if exists)
-        if: ${{ hashFiles('ci/qa.json') != '' }}
+      - name: Upload QA report
         uses: actions/upload-artifact@v4
         with:
           name: qa
           path: ci/qa.json
+
+      - name: Comment QA verdict on PR (best-effort)
+        if: ${{ hashFiles('ci/pr_url.txt') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR_URL="$(cat ci/pr_url.txt)"
+          VERDICT="$(jq -r .verdict ci/qa.json)"
+          VIOLATIONS="$(jq -r '.violations[]? | "- [" + .type + "] " + .detail' ci/qa.json || true)"
+
+          BODY="QA verdict: **${VERDICT}**\n\n"
+          if [ -n "$VIOLATIONS" ]; then
+            BODY="${BODY}Violations:\n${VIOLATIONS}\n"
+          else
+            BODY="${BODY}(no violations reported)\n"
+          fi
+
+          gh pr comment "$PR_URL" --body "$BODY"
