@@ -1,53 +1,98 @@
-name: "AI Debug (3 agents: ARCH -> DEV -> QA)"
+name: AI Debug (3 agents: ARCH -> DEV -> QA)
 
 on:
   workflow_dispatch:
     inputs:
       issue:
-        description: "Issue number (optional)"
-        required: false
-        default: ""
+        description: "Issue number to use as task"
+        required: true
+        type: string
       dry_run:
-        description: "Dry-run mode (no API, no secrets)"
+        description: "Dry-run (no API calls)"
         required: true
         default: "true"
         type: choice
         options:
           - "true"
           - "false"
+  issues:
+    types: [opened, labeled, edited]
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+concurrency:
+  group: ai-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OUTPUT_DIR: output
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    outputs:
+      issue_num: ${{ steps.resolve.outputs.issue_num }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare folders (safe)
+      - name: Resolve ISSUE_NUM + DRY_RUN
+        id: resolve
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .ai ci output
 
-      - name: Validate secrets/vars presence (only if NOT dry-run)
-        if: ${{ inputs.dry_run != 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          missing=0
+          ISSUE_NUM=""
+          DRY_RUN="true"
 
-          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::Missing secret: OPENAI_API_KEY"
-            missing=1
+          # If manual dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ISSUE_NUM="${{ inputs.issue }}"
+            DRY_RUN="${{ inputs.dry_run }}"
+          else
+            # issues event
+            ISSUE_NUM="${{ github.event.issue.number }}"
+            # enable dry_run unless label "run-live" exists
+            DRY_RUN="true"
           fi
 
-          for v in ARCH_MODEL DEV_MODEL QA_MODEL LLM_ENDPOINT; do
-            if [ -z "${{ vars[format('{0}', v)] }}" ]; then
-              echo "::error::Missing repo variable: $v"
-              missing=1
-            fi
-          done
+          if [ -z "${ISSUE_NUM}" ]; then
+            echo "ISSUE_NUM is empty" >&2
+            exit 1
+          fi
 
-          exit $missing
+          echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare output dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIR}"
+
+      - name: Validate repo structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ".ai/contract.md"
+
+      - name: Validate secrets/vars presence (dry-run skips API requirements)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.resolve.outputs.dry_run }}" = "true" ]; then
+            echo "DRY_RUN=true -> skipping API secret checks"
+            exit 0
+          fi
+
+          # Live mode requires LLM_API_KEY (or OPENAI_API_KEY fallback)
+          if [ -z "${{ secrets.LLM_API_KEY }}" ] && [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "Missing secret: LLM_API_KEY (or OPENAI_API_KEY)" >&2
+            exit 1
+          fi
 
   arch:
     needs: preflight
@@ -55,42 +100,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build ARCH prompt
+      - name: Prepare output dir
         shell: bash
         run: |
           set -euo pipefail
-          cat > output/arch_prompt.txt <<EOF
-You are ARCH agent. Analyze the issue and produce a plan.
-issue=${{ inputs.issue }}
-dry_run=${{ inputs.dry_run }}
-EOF
+          mkdir -p "${OUTPUT_DIR}"
 
-      - name: DRY-RUN: placeholder ARCH result
-        if: ${{ inputs.dry_run == 'true' }}
+      - name: ARCH (dry-run)
+        if: needs.preflight.outputs.dry_run == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cat > output/arch_result.txt <<'EOF'
-DRY-RUN MODE
-- No API calls were made.
-- Placeholder ARCH plan produced.
+          cat > "${OUTPUT_DIR}/arch_plan.md" <<EOF
+# ARCH PLAN (DRY-RUN)
+
+Issue: #${{ needs.preflight.outputs.issue_num }}
+
+- Repo structure: OK
+- Next: DEV stage would propose a patch
+- Then: QA would verify expected outputs
 EOF
 
-      - name: REAL: call ARCH model (stub)
-        if: ${{ inputs.dry_run != 'true' }}
+      - name: ARCH (live)
+        if: needs.preflight.outputs.dry_run != 'true'
         shell: bash
         env:
+          ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MODEL: ${{ vars.ARCH_MODEL }}
-          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
           set -euo pipefail
-          echo "REAL MODE would call endpoint=$ENDPOINT model=$MODEL" > output/arch_result.txt
+          echo "LIVE mode not wired yet (intentional)."
+          exit 1
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload arch artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: arch-output
-          path: output/
+          name: arch-out
+          path: output/arch_plan.md
 
   dev:
     needs: arch
@@ -98,50 +147,36 @@ EOF
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Prepare output dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIR}"
+
+      - name: Download arch artifact
+        uses: actions/download-artifact@v4
         with:
-          name: arch-output
-          path: output/
+          name: arch-out
+          path: output
 
-      - name: Build DEV prompt
+      - name: DEV (dry-run)
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "You are DEV agent. Implement based on ARCH."
-            echo "dry_run=${{ inputs.dry_run }}"
-            echo
-            echo "ARCH_RESULT:"
-            cat output/arch_result.txt
-          } > output/dev_prompt.txt
+          test -f output/arch_plan.md
+          cat > "${OUTPUT_DIR}/dev_patch.md" <<EOF
+# DEV PATCH (DRY-RUN)
 
-      - name: DRY-RUN: placeholder DEV result
-        if: ${{ inputs.dry_run == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > output/dev_result.txt <<'EOF'
-DRY-RUN MODE
-- No API calls were made.
-- No repo files modified.
-- Placeholder DEV changeset produced.
+Would implement the ARCH plan for issue #${{ github.run_id }}.
+
+(No code changes in dry-run.)
 EOF
 
-      - name: REAL: call DEV model (stub)
-        if: ${{ inputs.dry_run != 'true' }}
-        shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MODEL: ${{ vars.DEV_MODEL }}
-          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          echo "REAL MODE would call endpoint=$ENDPOINT model=$MODEL" > output/dev_result.txt
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload dev artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: dev-output
-          path: output/
+          name: dev-out
+          path: output/dev_patch.md
 
   qa:
     needs: dev
@@ -149,46 +184,36 @@ EOF
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Prepare output dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIR}"
+
+      - name: Download dev artifact
+        uses: actions/download-artifact@v4
         with:
-          name: dev-output
-          path: output/
+          name: dev-out
+          path: output
 
-      - name: Build QA prompt
+      - name: QA (dry-run)
         shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "You are QA agent. Review implementation."
-            echo "dry_run=${{ inputs.dry_run }}"
-            echo
-            echo "DEV_RESULT:"
-            cat output/dev_result.txt
-          } > output/qa_prompt.txt
+          test -f output/dev_patch.md
+          cat > "${OUTPUT_DIR}/qa_report.md" <<EOF
+# QA REPORT (DRY-RUN)
 
-      - name: DRY-RUN: placeholder QA report
-        if: ${{ inputs.dry_run == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > output/qa_report.txt <<'EOF'
-DRY-RUN MODE
-Verdict: PASS (simulated)
-- No API calls were made.
+Checks:
+- arch artifact exists: OK
+- dev artifact exists: OK
+- contract exists: OK
+
+Result: PASS
 EOF
 
-      - name: REAL: call QA model (stub)
-        if: ${{ inputs.dry_run != 'true' }}
-        shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MODEL: ${{ vars.QA_MODEL }}
-          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
-        run: |
-          set -euo pipefail
-          echo "REAL MODE would call endpoint=$ENDPOINT model=$MODEL" > output/qa_report.txt
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload qa artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: qa-output
-          path: output/
+          name: qa-out
+          path: output/qa_report.md
