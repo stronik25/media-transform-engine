@@ -1,0 +1,5 @@
+.github/workflows/**
+ci/**
+scripts/**
+.ai/**
+README.md
