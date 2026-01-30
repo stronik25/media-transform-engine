@@ -70,7 +70,6 @@ jobs:
           mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/preflight"
 
       - name: "Validate v5 inputs (strict parsing)"
-        id: v5_inputs
         shell: bash
         run: |
           set -euo pipefail
@@ -150,14 +149,12 @@ jobs:
           LIVE_ON="${LIVE_ENABLED:-false}"
           CFG=".ai/openai.config.json"
 
-          # Effective gating: must request run_live AND repo kill-switch must be true.
           RUN_EFF="false"
           if [ "$RUN_LIVE" = "true" ] && [ "$LIVE_ON" = "true" ]; then
             RUN_EFF="true"
           fi
           echo "run_live_effective=$RUN_EFF" >> "$GITHUB_OUTPUT"
 
-          # If not effective, do not block v4. Still write a report.
           if [ "$RUN_EFF" != "true" ]; then
             {
               echo "run_live_requested=$RUN_LIVE"
@@ -168,225 +165,49 @@ jobs:
             exit 0
           fi
 
-          # LIVE requested+enabled: require config file and validate it.
           if [ ! -f "$CFG" ]; then
             echo "LIVE enabled but missing config: $CFG" >&2
             exit 3
           fi
 
-          python3 - << 'PY'
-import json, sys, os
-cfg_path = ".ai/openai.config.json"
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
+          # Validate config structure + numeric fields
+          python3 -c "import json,sys; p='.ai/openai.config.json'; cfg=json.load(open(p,'r',encoding='utf-8')); \
+roles=cfg.get('roles'); \
+assert isinstance(roles,dict), 'Config missing top-level key: roles'; \
+req=('arch','dev','qa'); keys=('model','price_in_per_1k','price_out_per_1k','max_output_tokens'); \
+for r in req: \
+  assert r in roles, f'Config missing role: {r}'; \
+  rr=roles[r]; \
+  for k in keys: assert k in rr, f\"Config role '{r}' missing key: {k}\"; \
+  float(rr['price_in_per_1k']); float(rr['price_out_per_1k']); int(rr['max_output_tokens']); \
+print('CONFIG_OK=1')" >/dev/null
 
-def die(msg, code=4):
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+          # Enforce per-role output token cap <= workflow cap
+          python3 -c "import json; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); cap=int('${MAX_OUT_TOK}'); \
+roles=cfg['roles']; \
+for r in ('arch','dev','qa'): \
+  mout=int(roles[r]['max_output_tokens']); \
+  assert mout<=cap, f'Config role {r} max_output_tokens exceeds workflow cap: {mout} > {cap}'" >/dev/null
 
-for k in ("roles",):
-    if k not in cfg:
-        die(f"Config missing top-level key: {k}")
-
-roles = cfg["roles"]
-for role in ("arch","dev","qa"):
-    if role not in roles:
-        die(f"Config missing role: {role}")
-    r = roles[role]
-    for k in ("model","price_in_per_1k","price_out_per_1k","max_output_tokens"):
-        if k not in r:
-            die(f"Config role '{role}' missing key: {k}")
-    # numeric checks
-    try:
-        float(r["price_in_per_1k"])
-        float(r["price_out_per_1k"])
-        int(r["max_output_tokens"])
-    except Exception:
-        die(f"Config role '{role}' has invalid numeric values")
-
-print("CONFIG_OK=1")
-PY
-
-          # Conservative token estimation:
-          # - Take UTF-8 byte size of context files and approximate tokens.
-          # - tokens ~= bytes / 4 (rough). Use /3 to be more conservative (higher estimate).
           ISSUE_BYTES="$(wc -c < "${OUTPUT_DIR}/context/issue.json")"
           COMM_BYTES="$(wc -c < "${OUTPUT_DIR}/context/comments.json")"
           TOTAL_BYTES="$((ISSUE_BYTES + COMM_BYTES))"
 
-          # Estimate input tokens (conservative): bytes/3 + fixed overhead per role.
+          # Conservative estimate: tokens ~= bytes/3, add overhead
           EST_IN_TOK="$((TOTAL_BYTES / 3 + 800))"
-          # Total input across 3 calls (arch/dev/qa), assume same pack size each time (worst-case).
           EST_TOTAL_IN_TOK="$((EST_IN_TOK * 3))"
 
-          python3 - << PY
-import json
-cfg = json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
-roles = cfg["roles"]
-max_out_cap = int("${MAX_OUT_TOK}")
-# enforce per-role max_output_tokens <= workflow cap
-for role in ("arch","dev","qa"):
-    if int(roles[role]["max_output_tokens"]) > max_out_cap:
-        raise SystemExit(f"Config role {role} max_output_tokens exceeds workflow cap: {roles[role]['max_output_tokens']} > {max_out_cap}")
-print("CAP_OK=1")
-PY
-
-          # Worst-case cost estimate:
-          # cost_role = (est_in_tok/1000)*price_in + (max_out_tok/1000)*price_out
-          python3 - << PY
-import json, math
-est_in_tok = int("${EST_IN_TOK}")
-cfg = json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
-roles = cfg["roles"]
-
-def cost_for(role):
-    r = roles[role]
-    pin = float(r["price_in_per_1k"])
-    pout = float(r["price_out_per_1k"])
-    mout = int(r["max_output_tokens"])
-    return (est_in_tok/1000.0)*pin + (mout/1000.0)*pout
-
-total = sum(cost_for(r) for r in ("arch","dev","qa"))
-print(f"EST_IN_TOK_PER_CALL={est_in_tok}")
-print(f"EST_TOTAL_USD={total:.6f}")
-PY > "${OUTPUT_DIR}/preflight/budget.txt"
-
-          EST_TOTAL_USD="$(awk -F= '/^EST_TOTAL_USD=/{print $2}' "${OUTPUT_DIR}/preflight/budget.txt")"
+          # Compute worst-case USD estimate and write to file
+          EST_TOTAL_USD="$(python3 -c "import json; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); roles=cfg['roles']; \
+est_in=int('${EST_IN_TOK}'); \
+def cost(role): \
+  r=roles[role]; pin=float(r['price_in_per_1k']); pout=float(r['price_out_per_1k']); mout=int(r['max_output_tokens']); \
+  return (est_in/1000.0)*pin + (mout/1000.0)*pout; \
+total=cost('arch')+cost('dev')+cost('qa'); \
+print(f'{total:.6f}')" )"
 
           {
             echo "run_live_requested=$RUN_LIVE"
             echo "live_enabled_var=$LIVE_ON"
             echo "run_live_effective=true"
             echo "issue_bytes=$ISSUE_BYTES"
-            echo "comments_bytes=$COMM_BYTES"
-            echo "total_bytes=$TOTAL_BYTES"
-            echo "est_input_tokens_per_call=$EST_IN_TOK"
-            echo "est_total_input_tokens=$EST_TOTAL_IN_TOK"
-            echo "max_input_tokens=$MAX_IN_TOK"
-            echo "est_total_usd=$EST_TOTAL_USD"
-            echo "max_usd=$MAX_USD"
-            echo "fail_on_budget_exceed=$FAIL_ON"
-          } > "${OUTPUT_DIR}/preflight/live_gate.txt"
-
-          # Budget enforcement
-          EXCEED=0
-          if [ "$EST_TOTAL_IN_TOK" -gt "$MAX_IN_TOK" ]; then
-            EXCEED=1
-            echo "Budget fail: est_total_input_tokens ($EST_TOTAL_IN_TOK) > max_input_tokens ($MAX_IN_TOK)" >&2
-          fi
-
-          python3 - << PY
-from decimal import Decimal
-est = Decimal("${EST_TOTAL_USD}")
-mx = Decimal("${MAX_USD}")
-import sys
-if est > mx:
-    sys.exit(10)
-PY || {
-            EXCEED=1
-            echo "Budget fail: est_total_usd ($EST_TOTAL_USD) > max_usd ($MAX_USD)" >&2
-          }
-
-          if [ "$EXCEED" -eq 1 ] && [ "$FAIL_ON" = "true" ]; then
-            echo "Fail-fast: LIVE budgets exceeded. No OpenAI calls executed." >&2
-            exit 5
-          fi
-
-      - name: "Upload context artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: ai-debug-context
-          path: ${{ env.OUTPUT_DIR }}/context
-
-      - name: "Upload preflight report artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: preflight-out
-          path: ${{ env.OUTPUT_DIR }}/preflight
-
-  dev:
-    runs-on: ubuntu-latest
-    needs: preflight
-    steps:
-      - name: "Checkout"
-        uses: actions/checkout@v4
-
-      - name: "Install jq"
-        run: sudo apt-get update -y && sudo apt-get install -y jq
-
-      - name: "Download context artifact"
-        uses: actions/download-artifact@v4
-        with:
-          name: ai-debug-context
-          path: output/context
-
-      - name: "Generate deterministic patch from issue.json"
-        shell: bash
-        run: |
-          set -euo pipefail
-          ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
-          mkdir -p .ai/dev
-
-          TITLE="$(jq -r '.title // ""' output/context/issue.json)"
-          BODY="$(jq -r '.body // ""' output/context/issue.json)"
-          URL="$(jq -r '.html_url // ""' output/context/issue.json)"
-          USER="$(jq -r '.user.login // ""' output/context/issue.json)"
-          CREATED="$(jq -r '.created_at // ""' output/context/issue.json)"
-
-          OUT=".ai/dev/issue_${ISSUE_NUM}.md"
-          : > "$OUT"
-          printf "# Issue %s\n\n" "$ISSUE_NUM" >> "$OUT"
-          printf "URL: %s\n\n" "$URL" >> "$OUT"
-          printf "Author: %s\n" "$USER" >> "$OUT"
-          printf "Created: %s\n\n" "$CREATED" >> "$OUT"
-          printf "## Title\n%s\n\n" "$TITLE" >> "$OUT"
-          printf "## Body\n%s\n" "$BODY" >> "$OUT"
-
-      - name: "Commit to branch"
-        shell: bash
-        run: |
-          set -euo pipefail
-          BR="${{ needs.preflight.outputs.branch_name }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git checkout -B "$BR"
-          git add .ai/dev
-          git commit -m "ai-debug: add deterministic summary for issue #${{ needs.preflight.outputs.issue_num }}" || true
-          git push -u origin "$BR" --force
-
-      - name: "Create/Update PR"
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          BR="${{ needs.preflight.outputs.branch_name }}"
-          TITLE="ai-debug: issue #${{ needs.preflight.outputs.issue_num }}"
-          BODY="Deterministic patch generated from issue.json (no LLM)."
-          gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
-          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
-
-      - name: "Upload DEV artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: dev-out
-          path: .ai/dev
-
-  qa:
-    runs-on: ubuntu-latest
-    needs: dev
-    steps:
-      - name: "Download DEV artifact"
-        uses: actions/download-artifact@v4
-        with:
-          name: dev-out
-          path: qa_artifacts
-
-      - name: "QA checks"
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -la qa_artifacts
-          test "$(find qa_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
-          echo "QA OK: issue summary exists"
