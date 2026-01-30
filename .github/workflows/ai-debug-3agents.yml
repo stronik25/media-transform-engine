@@ -37,6 +37,10 @@ permissions:
   pull-requests: write
   issues: read
 
+concurrency:
+  group: "ai-debug-${{ github.workflow }}-issue-${{ inputs.issue }}-live-${{ inputs.run_live }}-apply-${{ inputs.apply_live }}"
+  cancel-in-progress: false
+
 env:
   OUTPUT_DIR: output
   BRANCH_PREFIX: ai-debug/issue-
@@ -45,6 +49,7 @@ env:
 jobs:
   preflight:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       issue_num: ${{ steps.vars.outputs.issue_num }}
       branch_name: ${{ steps.vars.outputs.branch_name }}
@@ -222,6 +227,7 @@ jobs:
   dev:
     runs-on: ubuntu-latest
     needs: preflight
+    timeout-minutes: 10
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
@@ -291,6 +297,7 @@ jobs:
   qa:
     runs-on: ubuntu-latest
     needs: dev
+    timeout-minutes: 5
     steps:
       - name: "Download DEV artifact"
         uses: actions/download-artifact@v4
@@ -309,6 +316,7 @@ jobs:
   arch_live:
     runs-on: ubuntu-latest
     needs: preflight
+    timeout-minutes: 15
     if: needs.preflight.outputs.run_live_effective == 'true'
     steps:
       - name: "Download context artifact"
@@ -323,7 +331,7 @@ jobs:
           name: preflight-out
           path: output/preflight
 
-      - name: "Run ARCH (OpenAI Responses API)"
+      - name: "Run ARCH (OpenAI Responses API) with retries"
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -343,12 +351,23 @@ jobs:
           USR="Context:\nURL: ${URL}\n\nTitle:\n${TITLE}\n\nBody:\n${BODY}\n\nTask:\nWrite ARCH plan for next changes in this repo. Keep it short and actionable."
 
           mkdir -p output/live/arch
-          python3 .ai/scripts/openai_call.py \
-            --model "$MODEL" \
-            --max_output_tokens "$MOUT" \
-            --system "$SYS" \
-            --user "$USR" \
-            --out_dir output/live/arch
+
+          for i in 1 2 3; do
+            echo "ARCH attempt $i/3"
+            if python3 .ai/scripts/openai_call.py \
+              --model "$MODEL" \
+              --max_output_tokens "$MOUT" \
+              --system "$SYS" \
+              --user "$USR" \
+              --out_dir output/live/arch; then
+              break
+            fi
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 5))
+            else
+              exit 1
+            fi
+          done
 
       - name: "Upload LIVE ARCH artifact"
         uses: actions/upload-artifact@v4
@@ -359,6 +378,7 @@ jobs:
   dev_live:
     runs-on: ubuntu-latest
     needs: arch_live
+    timeout-minutes: 15
     if: needs.arch_live.result == 'success'
     steps:
       - name: "Download context artifact"
@@ -379,7 +399,7 @@ jobs:
           name: live-arch
           path: output/live/arch
 
-      - name: "Run DEV (OpenAI Responses API)"
+      - name: "Run DEV (OpenAI Responses API) with retries"
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -404,15 +424,27 @@ jobs:
           ARCH_PLAN="$(cat output/live/arch/arch.md)"
 
           SYS="You are DEV. Produce a deterministic patch proposal in Markdown. No shell commands. No git. Output only Markdown for file .ai/dev/issue_<N>.md."
-          USR="Goal:\nGenerate the content of file: .ai/dev/issue_${ISSUE_NUM}.md\n\nInputs:\nURL: ${URL}\nTitle: ${TITLE}\nBody:\n${BODY}\n\nARCH plan:\n${ARCH_PLAN}\n\nRules:\n- Output MUST be valid Markdown.\n- Include: Summary, Proposed changes, Files to touch, Tests, Risks.\n- Do not include code blocks unless strictly necessary.\n- Keep it concise and actionable."
+          USR="Goal:\nGenerate the content of file: .ai/dev/issue_${ISSUE_NUM}.md\n\nInputs:\nURL: ${URL}\nTitle: ${TITLE}\nBody:\n${BODY}\n\nARCH plan:\n${ARCH_PLAN}\n\nRules:\n- Output MUST be valid Markdown.\n- Include: Summary, Proposed changes, Files to touch, Tests, Risks.\n- Use headings exactly: '## Summary', '## Proposed changes', '## Files to touch', '## Tests', '## Risks'.\n- Keep it concise and actionable."
 
           mkdir -p output/live/dev
-          python3 .ai/scripts/openai_call.py \
-            --model "$MODEL" \
-            --max_output_tokens "$MOUT" \
-            --system "$SYS" \
-            --user "$USR" \
-            --out_dir output/live/dev
+
+          for i in 1 2 3; do
+            echo "DEV attempt $i/3"
+            rm -f output/live/dev/arch.md || true
+            if python3 .ai/scripts/openai_call.py \
+              --model "$MODEL" \
+              --max_output_tokens "$MOUT" \
+              --system "$SYS" \
+              --user "$USR" \
+              --out_dir output/live/dev; then
+              break
+            fi
+            if [ "$i" -lt 3 ]; then
+              sleep $((i * 5))
+            else
+              exit 1
+            fi
+          done
 
           test -f output/live/dev/arch.md
           mv output/live/dev/arch.md "output/live/dev/issue_${ISSUE_NUM}.md"
@@ -426,6 +458,7 @@ jobs:
   qa_live:
     runs-on: ubuntu-latest
     needs: dev_live
+    timeout-minutes: 5
     if: needs.dev_live.result == 'success'
     steps:
       - name: "Download LIVE DEV artifact"
@@ -434,20 +467,29 @@ jobs:
           name: live-dev
           path: output/live/dev
 
-      - name: "QA LIVE checks (artifacts only)"
+      - name: "QA LIVE checks (artifacts only, strict)"
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p output/live/qa
 
-          test "$(find output/live/dev -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
+          ISSUE_MD="$(find output/live/dev -maxdepth 1 -type f -name 'issue_*.md' | head -n 1)"
+          test -n "$ISSUE_MD"
           test -f output/live/dev/response.json
 
+          # Strict structure checks (case-insensitive)
+          grep -qiE '^##[[:space:]]+Summary[[:space:]]*$' "$ISSUE_MD"
+          grep -qiE '^##[[:space:]]+Proposed changes[[:space:]]*$' "$ISSUE_MD"
+          grep -qiE '^##[[:space:]]+Files to touch[[:space:]]*$' "$ISSUE_MD"
+          grep -qiE '^##[[:space:]]+Tests[[:space:]]*$' "$ISSUE_MD"
+          grep -qiE '^##[[:space:]]+Risks[[:space:]]*$' "$ISSUE_MD"
+
+          mkdir -p output/live/qa
           {
             echo "# QA LIVE report"
             echo ""
-            echo "PASS: DEV generated issue_*.md and response.json."
-            echo "Note: This QA checks artifacts only. No repo checkout."
+            echo "PASS: DEV generated issue_*.md + response.json."
+            echo "PASS: Required headings present."
+            echo "Note: Artifact-only QA; no repo checkout."
           } > output/live/qa/report.md
 
       - name: "Upload LIVE QA artifact"
@@ -458,8 +500,10 @@ jobs:
 
   apply_live_dev:
     runs-on: ubuntu-latest
-    needs: [dev_live, preflight]
-    if: needs.preflight.outputs.run_live_effective == 'true' && inputs.apply_live == 'true' && needs.dev_live.result == 'success'
+    needs: [dev_live, preflight, qa_live]
+    timeout-minutes: 10
+    if: needs.preflight.outputs.run_live_effective == 'true' && inputs.apply_live == 'true' && needs.dev_live.result == 'success' && needs.qa_live.result == 'success'
+    environment: live-apply
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
@@ -494,7 +538,7 @@ jobs:
           git push -u origin "$BR" --force
 
           TITLE="ai-live: issue #${ISSUE_NUM}"
-          BODY="Applied LIVE DEV output into .ai/dev/issue_${ISSUE_NUM}.md (controlled by apply_live=true)."
+          BODY="Applied LIVE DEV output into .ai/dev/issue_${ISSUE_NUM}.md (controlled by apply_live=true; gated by environment live-apply)."
 
           gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
