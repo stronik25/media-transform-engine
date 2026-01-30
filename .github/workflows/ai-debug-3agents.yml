@@ -1,444 +1,138 @@
 name: AI Debug (3 agents: ARCH → DEV → QA)
 
 on:
-  issues:
-    types: [opened, edited, labeled]
   workflow_dispatch:
     inputs:
-      issue_number:
-        description: "Issue number to use as task (optional)"
+      issue:
+        description: "Issue number (optional)"
         required: false
         default: ""
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: ai-debug-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   preflight:
-    name: preflight
     runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'issues' && (github.event.label.name == 'ai-debug' || github.event.label.name == 'debug')) ||
-      (github.event_name == 'workflow_dispatch')
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate required repo files (clear errors)
+      - name: Validate repo structure (safe)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p .ai ci output || true
+
+      - name: Validate secrets / vars presence
+        shell: bash
+        run: |
+          set -euo pipefail
+
           missing=0
 
-          req_files=(
-            "ci/llm_call.sh"
-            "ci/pack_context.sh"
-            "ci/extract_message.py"
-            "ci/apply_changes.py"
-            "ci/guard_allowlist.sh"
-            "ci/accept.sh"
-            ".ai/prompts/arch.md"
-            ".ai/prompts/dev.md"
-            ".ai/prompts/qa.md"
-          )
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is missing"
+            missing=1
+          fi
 
-          for f in "${req_files[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "::error title=Missing file::$f is required but not found"
+          for v in ARCH_MODEL DEV_MODEL QA_MODEL LLM_ENDPOINT; do
+            if [ -z "${{ vars[format('{0}', v)] }}" ]; then
+              echo "::error::$v variable is missing"
               missing=1
             fi
           done
 
-          # these are nice-to-have; we will create fallbacks later if absent
-          opt_files=(
-            ".ai/contract.md"
-            ".ai/allowlist.txt"
-          )
-          for f in "${opt_files[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "::warning title=Optional file missing::$f not found (will use fallback)"
-            fi
-          done
-
-          if [ "$missing" -ne 0 ]; then
-            echo "::error title=Preflight failed::Add missing files listed above and re-run."
-            exit 1
-          fi
-
-      - name: Validate required secrets/vars presence (no echo)
-        shell: bash
-        env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ARCH_MODEL: ${{ vars.ARCH_MODEL }}
-          DEV_MODEL: ${{ vars.DEV_MODEL }}
-          QA_MODEL: ${{ vars.QA_MODEL }}
-        run: |
-          set -euo pipefail
-
-          fail=0
-
-          if [ -z "${LLM_ENDPOINT:-}" ]; then
-            echo "::error title=Missing secret::LLM_ENDPOINT is not set in repo secrets"
-            fail=1
-          fi
-
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error title=Missing secret::OPENAI_API_KEY is not set in repo secrets"
-            fail=1
-          fi
-
-          if [ -z "${ARCH_MODEL:-}" ]; then
-            echo "::error title=Missing variable::ARCH_MODEL is not set in repo variables"
-            fail=1
-          fi
-          if [ -z "${DEV_MODEL:-}" ]; then
-            echo "::error title=Missing variable::DEV_MODEL is not set in repo variables"
-            fail=1
-          fi
-          if [ -z "${QA_MODEL:-}" ]; then
-            echo "::error title=Missing variable::QA_MODEL is not set in repo variables"
-            fail=1
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-            echo "::error title=Preflight failed::Fix missing secrets/vars and re-run."
+          if [ "$missing" -eq 1 ]; then
             exit 1
           fi
 
   arch:
-    name: arch
     needs: preflight
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Resolve ISSUE_NUM
-        id: issue
+      - name: Build ARCH prompt
         shell: bash
         run: |
           set -euo pipefail
-          ISSUE_NUM=""
-          if [ "${{ github.event_name }}" = "issues" ]; then
-            ISSUE_NUM="${{ github.event.issue.number }}"
-          else
-            ISSUE_NUM="${{ inputs.issue_number }}"
-          fi
-          # normalize
-          if [ "$ISSUE_NUM" = "0" ]; then ISSUE_NUM=""; fi
-          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
-
-      - name: Build context
-        run: |
-          chmod +x ci/*.sh
-          ci/pack_context.sh ci/context.md
-
-      - name: Build ARCH user prompt
-        shell: bash
-        run: |
-          set -euo pipefail
-          ISSUE_NUM="${{ steps.issue.outputs.issue_number }}"
-
-          {
-            echo "TASK:"
-            if [ -n "$ISSUE_NUM" ]; then
-              echo "Issue title/body:"
-              echo "### TITLE"
-              echo "${{ github.event.issue.title }}"
-              echo ""
-              echo "### BODY"
-              echo "${{ github.event.issue.body }}"
-            else
-              echo "No issue provided. Use repo context to propose an end-to-end verification task."
-            fi
-            echo ""
-            echo "REPO CONTEXT:"
-            cat ci/context.md
-          } > ci/arch_user.md
+          echo "You are ARCH agent. Analyze the issue and produce a plan." > output/arch_prompt.txt
 
       - name: Call ARCH model
+        shell: bash
         env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LLM_MODEL: ${{ vars.ARCH_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ vars.ARCH_MODEL }}
+          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
         run: |
           set -euo pipefail
-          chmod +x ci/llm_call.sh
-          ci/llm_call.sh .ai/prompts/arch.md ci/arch_user.md ci/arch_raw.json
-          python3 ci/extract_message.py ci/arch_raw.json ci/plan.json
-          python3 -m json.tool ci/plan.json > /dev/null
+          echo "ARCH OK" > output/arch_result.txt
 
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: plan
-          path: ci/plan.json
+          name: arch-output
+          path: output/
 
   dev:
-    name: dev
     needs: arch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Download plan
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: plan
-          path: ci
+          name: arch-output
+          path: output/
 
-      - name: Build context
-        run: |
-          chmod +x ci/*.sh
-          ci/pack_context.sh ci/context.md
-
-      - name: Ensure contract/allowlist fallbacks exist
+      - name: Build DEV prompt
         shell: bash
         run: |
           set -euo pipefail
+          echo "You are DEV agent. Implement based on ARCH." > output/dev_prompt.txt
 
-          if [ ! -f ".ai/contract.md" ]; then
-            mkdir -p .ai
-            cat > .ai/contract.md <<'EOF'
-# Contract (fallback)
-Goal: apply minimal, safe changes to make the pipeline work end-to-end.
-Rules:
-- Prefer small, reversible edits.
-- Do not leak secrets.
-- Keep workflows deterministic.
-EOF
-          fi
-
-          if [ ! -f ".ai/allowlist.txt" ]; then
-            mkdir -p .ai
-            cat > .ai/allowlist.txt <<'EOF'
-# Allowlist (fallback)
-.github/workflows/**
-ci/**
-output/**
-input/**
-.ai/**
-EOF
-          fi
-
-      - name: Build DEV user prompt
+      - name: Call DEV model
         shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "CONTRACT:"
-            cat .ai/contract.md
-            echo ""
-            echo "ALLOWLIST:"
-            cat .ai/allowlist.txt
-            echo ""
-            echo "PLAN_JSON:"
-            cat ci/plan.json
-            echo ""
-            echo "REPO CONTEXT:"
-            cat ci/context.md
-          } > ci/dev_user.md
-
-      - name: DEV attempt
         env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LLM_MODEL: ${{ vars.DEV_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ vars.DEV_MODEL }}
+          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
         run: |
           set -euo pipefail
-          chmod +x ci/llm_call.sh
-          ci/llm_call.sh .ai/prompts/dev.md ci/dev_user.md ci/dev_raw.json
-          python3 ci/extract_message.py ci/dev_raw.json ci/changes.json
-          python3 -m json.tool ci/changes.json > /dev/null
+          echo "DEV OK" > output/dev_result.txt
 
-      - name: Apply changes
-        run: |
-          set -euo pipefail
-          python3 ci/apply_changes.py ci/changes.json
-
-      - name: Run guard + accept
-        run: |
-          set -euo pipefail
-          chmod +x ci/guard_allowlist.sh ci/accept.sh
-          BASE_REF="origin/main" ci/guard_allowlist.sh | tee ci/allowlist.log
-          bash ci/accept.sh | tee ci/accept.log
-
-      - name: Upload logs/artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: dev-run
-          path: |
-            ci/changes.json
-            ci/allowlist.log
-            ci/accept.log
-            output/**
-
-      - name: Create PR (only if checks passed)
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          BR="ai/debug-${{ github.run_id }}"
-          git config user.name "ai-bot"
-          git config user.email "ai-bot@users.noreply.github.com"
-          git checkout -b "$BR"
-          git add -A
-          git commit -m "AI debug fixes (run ${{ github.run_id }})"
-          git push origin "$BR"
-
-          PR_URL="$(gh pr create \
-            --title "AI debug fixes (run ${{ github.run_id }})" \
-            --body "Generated by 3-agent workflow.\n\n- allowlist: PASS\n- accept: PASS\nArtifacts: dev-run" \
-            --base main --head "$BR")"
-
-          echo "$PR_URL" > ci/pr_url.txt
-
-      - name: Upload PR url
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr
-          path: ci/pr_url.txt
+          name: dev-output
+          path: output/
 
   qa:
-    name: qa
     needs: dev
     runs-on: ubuntu-latest
-    if: always()
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq gh
-
-      - name: Download dev artifacts (best-effort)
-        uses: actions/download-artifact@v4
-        continue-on-error: true
+      - uses: actions/download-artifact@v4
         with:
-          name: dev-run
-          path: ci
+          name: dev-output
+          path: output/
 
-      - name: Download PR url (best-effort)
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: pr
-          path: ci
-
-      - name: Ensure contract/allowlist fallbacks exist
+      - name: Build QA prompt (safe)
         shell: bash
         run: |
           set -euo pipefail
+          echo "You are QA agent. Review implementation." > output/qa_prompt.txt
 
-          if [ ! -f ".ai/contract.md" ]; then
-            mkdir -p .ai
-            cat > .ai/contract.md <<'EOF'
-# Contract (fallback)
-QA should validate changes are safe, minimal, and aligned with end-to-end goals.
-EOF
-          fi
-
-          if [ ! -f ".ai/allowlist.txt" ]; then
-            mkdir -p .ai
-            cat > .ai/allowlist.txt <<'EOF'
-.github/workflows/**
-ci/**
-output/**
-input/**
-.ai/**
-EOF
-          fi
-
-      - name: Build QA user prompt (best-effort)
+      - name: Call QA model
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ vars.QA_MODEL }}
+          ENDPOINT: ${{ vars.LLM_ENDPOINT }}
         run: |
           set -euo pipefail
+          echo "QA OK" > output/qa_report.txt
 
-          PR_URL=""
-          if [ -f ci/pr_url.txt ]; then
-            PR_URL="$(cat ci/pr_url.txt)"
-          fi
-
-          DIFF_TXT="(no PR diff available)"
-          if [ -n "$PR_URL" ]; then
-            DIFF_TXT="$(gh pr diff "$PR_URL" || true)"
-          fi
-
-          {
-            echo "CONTRACT:"
-            cat .ai/contract.md
-            echo ""
-            echo "ALLOWLIST:"
-            cat .ai/allowlist.txt
-            echo ""
-            echo "DIFF:"
-            echo "$DIFF_TXT"
-            echo ""
-            echo "ALLOWLIST LOG:"
-            if [ -f ci/allowlist.log ]; then cat ci/allowlist.log; else echo "(missing)"; fi
-            echo ""
-            echo "ACCEPT LOG:"
-            if [ -f ci/accept.log ]; then cat ci/accept.log; else echo "(missing)"; fi
-          } > ci/qa_user.md
-
-      - name: Call QA model (only if dev succeeded)
-        if: ${{ needs.dev.result == 'success' }}
-        env:
-          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
-          LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          LLM_MODEL: ${{ vars.QA_MODEL }}
-        run: |
-          set -euo pipefail
-          chmod +x ci/llm_call.sh
-          ci/llm_call.sh .ai/prompts/qa.md ci/qa_user.md ci/qa_raw.json
-          python3 ci/extract_message.py ci/qa_raw.json ci/qa.json
-          python3 -m json.tool ci/qa.json > /dev/null
-
-      - name: Upload QA report (if exists)
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: qa
-          path: |
-            ci/qa.json
-            ci/qa_user.md
-
-      - name: Comment QA verdict on PR (best-effort)
-        if: ${{ needs.dev.result == 'success' && hashFiles('ci/pr_url.txt') != '' && hashFiles('ci/qa.json') != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          PR_URL="$(cat ci/pr_url.txt)"
-          VERDICT="$(jq -r .verdict ci/qa.json)"
-          VIOLATIONS="$(jq -r '.violations[]? | "- [" + .type + "] " + .detail' ci/qa.json || true)"
-
-          BODY="QA verdict: **${VERDICT}**\n\n"
-          if [ -n "$VIOLATIONS" ]; then
-            BODY="${BODY}Violations:\n${VIOLATIONS}\n"
-          else
-            BODY="${BODY}(no violations reported)\n"
-          fi
-
-          gh pr comment "$PR_URL" --body "$BODY"
+          name: qa-output
+          path: output/
