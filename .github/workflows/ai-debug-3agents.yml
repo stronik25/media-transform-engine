@@ -1,4 +1,4 @@
-name: AI Debug (3 agents: ARCH → DEV → QA)
+name: "AI Debug (3 agents: ARCH → DEV → QA)"
 
 on:
   issues:
@@ -17,11 +17,10 @@ permissions:
 
 jobs:
   arch:
-    if: |
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'debug') ||
+    if: >
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'ai-debug')) ||
       (github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -36,10 +35,18 @@ jobs:
           ci/pack_context.sh ci/context.md
 
       - name: Build ARCH user prompt
+        shell: bash
         run: |
+          set -euo pipefail
+
           ISSUE_NUM=""
+          ISSUE_TITLE=""
+          ISSUE_BODY=""
+
           if [ "${{ github.event_name }}" = "issues" ]; then
             ISSUE_NUM="${{ github.event.issue.number }}"
+            ISSUE_TITLE="${{ github.event.issue.title }}"
+            ISSUE_BODY="${{ github.event.issue.body }}"
           else
             ISSUE_NUM="${{ inputs.issue_number }}"
           fi
@@ -47,11 +54,14 @@ jobs:
           {
             echo "TASK:"
             if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "0" ]; then
+              echo "Issue number: $ISSUE_NUM"
+              echo ""
+              echo "Issue title/body:"
               echo "### TITLE"
-              echo "${{ github.event.issue.title }}"
+              echo "$ISSUE_TITLE"
               echo ""
               echo "### BODY"
-              echo "${{ github.event.issue.body }}"
+              echo "$ISSUE_BODY"
             else
               echo "No issue provided. Use contract.md as the default goal."
             fi
@@ -201,7 +211,12 @@ jobs:
           path: ci
 
       - name: Build QA user prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           PR_URL=""
           if [ -f ci/pr_url.txt ]; then PR_URL="$(cat ci/pr_url.txt)"; fi
 
@@ -216,6 +231,9 @@ jobs:
             echo ""
             echo "ALLOWLIST:"
             cat .ai/allowlist.txt
+            echo ""
+            echo "PLAN_JSON:"
+            echo "(plan.json is available as artifact in job arch; not required for minimal QA)"
             echo ""
             echo "DIFF:"
             echo "$DIFF_TXT"
@@ -248,7 +266,9 @@ jobs:
         if: ${{ hashFiles('ci/pr_url.txt') != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          set -euo pipefail
           PR_URL="$(cat ci/pr_url.txt)"
           VERDICT="$(jq -r .verdict ci/qa.json)"
           VIOLATIONS="$(jq -r '.violations[]? | "- [" + .type + "] " + .detail' ci/qa.json || true)"
