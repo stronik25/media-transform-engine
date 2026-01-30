@@ -1,4 +1,4 @@
-name: AI Debug (3 agents: ARCH -> DEV -> QA)
+name: "AI Debug (3 agents: ARCH -> DEV -> QA)"
 
 on:
   workflow_dispatch:
