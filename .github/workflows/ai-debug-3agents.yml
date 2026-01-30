@@ -11,6 +11,10 @@ on:
         description: "Enable LIVE mode (OpenAI). Default false. Requires LIVE_ENABLED=true and valid config."
         required: false
         default: "false"
+      apply_live:
+        description: "Apply LIVE DEV output into repo (creates branch+PR). Default false."
+        required: false
+        default: "false"
       max_usd:
         description: "LIVE budget cap in USD (fail-fast)."
         required: false
@@ -36,6 +40,7 @@ permissions:
 env:
   OUTPUT_DIR: output
   BRANCH_PREFIX: ai-debug/issue-
+  LIVE_BRANCH_PREFIX: ai-live/issue-
 
 jobs:
   preflight:
@@ -82,6 +87,7 @@ jobs:
           is_money() { [[ "$1" =~ ^[0-9]+(\.[0-9]{1,4})?$ ]]; }
 
           RUN_LIVE="${{ inputs.run_live }}"
+          APPLY_LIVE="${{ inputs.apply_live }}"
           MAX_USD="${{ inputs.max_usd }}"
           MAX_IN_TOK="${{ inputs.max_input_tokens }}"
           MAX_OUT_TOK="${{ inputs.max_output_tokens_per_call }}"
@@ -89,6 +95,10 @@ jobs:
 
           if ! is_bool "$RUN_LIVE"; then
             echo "Invalid input run_live=$RUN_LIVE (must be true/false)" >&2
+            exit 2
+          fi
+          if ! is_bool "$APPLY_LIVE"; then
+            echo "Invalid input apply_live=$APPLY_LIVE (must be true/false)" >&2
             exit 2
           fi
           if ! is_money "$MAX_USD"; then
@@ -110,6 +120,7 @@ jobs:
 
           {
             echo "run_live=$RUN_LIVE"
+            echo "apply_live=$APPLY_LIVE"
             echo "max_usd=$MAX_USD"
             echo "max_input_tokens=$MAX_IN_TOK"
             echo "max_output_tokens_per_call=$MAX_OUT_TOK"
@@ -403,7 +414,6 @@ jobs:
             --user "$USR" \
             --out_dir output/live/dev
 
-          # openai_call writes arch.md by design; rename to issue_<N>.md for DEV stage
           test -f output/live/dev/arch.md
           mv output/live/dev/arch.md "output/live/dev/issue_${ISSUE_NUM}.md"
 
@@ -445,3 +455,46 @@ jobs:
         with:
           name: live-qa
           path: output/live/qa
+
+  apply_live_dev:
+    runs-on: ubuntu-latest
+    needs: [dev_live, preflight]
+    if: needs.preflight.outputs.run_live_effective == 'true' && inputs.apply_live == 'true' && needs.dev_live.result == 'success'
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Download LIVE DEV artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: live-dev
+          path: output/live/dev
+
+      - name: "Apply LIVE DEV output into repo"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
+          SRC="output/live/dev/issue_${ISSUE_NUM}.md"
+          test -f "$SRC"
+
+          mkdir -p .ai/dev
+          cp "$SRC" ".ai/dev/issue_${ISSUE_NUM}.md"
+
+          BR="${{ env.LIVE_BRANCH_PREFIX }}${ISSUE_NUM}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BR"
+          git add ".ai/dev/issue_${ISSUE_NUM}.md"
+          git commit -m "ai-live: apply DEV output for issue #${ISSUE_NUM}" || true
+          git push -u origin "$BR" --force
+
+          TITLE="ai-live: issue #${ISSUE_NUM}"
+          BODY="Applied LIVE DEV output into .ai/dev/issue_${ISSUE_NUM}.md (controlled by apply_live=true)."
+
+          gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
