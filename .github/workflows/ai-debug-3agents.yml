@@ -1,4 +1,4 @@
-name: "AI Debug (v3: issue -> dev patch -> PR)"
+name: "AI Debug (v4: issue -> deterministic patch -> PR)"
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/dev_patch"
+          mkdir -p "${OUTPUT_DIR}/context"
 
       - name: "Fetch issue context (title/body/comments)"
         shell: bash
@@ -68,23 +68,6 @@ jobs:
                "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE/comments?per_page=100" \
             > "${OUTPUT_DIR}/context/comments.json"
 
-      - name: "Build context markdown"
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "# AI Debug Context"
-            echo
-            echo "Issue: #${{ steps.vars.outputs.issue_num }}"
-            echo "Repo: ${{ github.repository }}"
-            echo "Run: ${{ github.run_id }}"
-            echo "SHA: ${{ github.sha }}"
-            echo
-            echo "## Contract"
-            echo
-            sed -n '1,200p' .ai/contract.md
-          } > "${OUTPUT_DIR}/context/context.md"
-
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
         with:
@@ -98,37 +81,37 @@ jobs:
       - name: "Checkout"
         uses: actions/checkout@v4
 
+      - name: "Install jq"
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+
       - name: "Download context artifact"
         uses: actions/download-artifact@v4
         with:
           name: ai-debug-context
           path: output/context
 
-      - name: "Create DEV patch (stub)"
+      - name: "Generate deterministic patch from issue.json"
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p output/dev_patch
-
-          {
-            echo "# DEV Patch Plan (stub)"
-            echo
-            echo "Issue: #${{ needs.preflight.outputs.issue_num }}"
-            echo
-            echo "## What this does"
-            echo "- Creates a safe placeholder file so PR wiring is proven"
-            echo "- Next iteration will generate real changes based on issue context"
-            echo
-            echo "## Next steps"
-            echo "- Add parsing of issue.json -> derive concrete edits"
-          } > output/dev_patch/plan.md
-
+          ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
           mkdir -p .ai/dev
-          {
-            echo "# ai-debug marker"
-            echo "issue=${{ needs.preflight.outputs.issue_num }}"
-            echo "run=${{ github.run_id }}"
-          } > .ai/dev/marker.txt
+
+          TITLE="$(jq -r '.title // ""' output/context/issue.json)"
+          BODY="$(jq -r '.body // ""' output/context/issue.json)"
+          URL="$(jq -r '.html_url // ""' output/context/issue.json)"
+          USER="$(jq -r '.user.login // ""' output/context/issue.json)"
+          CREATED="$(jq -r '.created_at // ""' output/context/issue.json)"
+
+          # Keep it deterministic, avoid heredoc pitfalls: use printf line-by-line.
+          OUT=".ai/dev/issue_${ISSUE_NUM}.md"
+          : > "$OUT"
+          printf "# Issue %s\n\n" "$ISSUE_NUM" >> "$OUT"
+          printf "URL: %s\n\n" "$URL" >> "$OUT"
+          printf "Author: %s\n" "$USER" >> "$OUT"
+          printf "Created: %s\n\n" "$CREATED" >> "$OUT"
+          printf "## Title\n%s\n\n" "$TITLE" >> "$OUT"
+          printf "## Body\n%s\n" "$BODY" >> "$OUT"
 
       - name: "Commit to branch"
         shell: bash
@@ -139,8 +122,8 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "$BR"
-          git add .ai/dev/marker.txt output/dev_patch/plan.md
-          git commit -m "ai-debug: stub patch for issue #${{ needs.preflight.outputs.issue_num }}" || true
+          git add .ai/dev
+          git commit -m "ai-debug: add deterministic summary for issue #${{ needs.preflight.outputs.issue_num }}" || true
           git push -u origin "$BR" --force
 
       - name: "Create/Update PR"
@@ -151,7 +134,7 @@ jobs:
           set -euo pipefail
           BR="${{ needs.preflight.outputs.branch_name }}"
           TITLE="ai-debug: issue #${{ needs.preflight.outputs.issue_num }}"
-          BODY="Automated stub patch PR. Next iteration will apply real edits from issue context."
+          BODY="Deterministic patch generated from issue.json (no LLM)."
           gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
 
@@ -159,9 +142,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dev-out
-          path: |
-            output/dev_patch
-            .ai/dev/marker.txt
+          path: .ai/dev
 
   qa:
     runs-on: ubuntu-latest
@@ -173,10 +154,10 @@ jobs:
           name: dev-out
           path: qa_artifacts
 
-      - name: "QA checks (artifact-based)"
+      - name: "QA checks"
         shell: bash
         run: |
           set -euo pipefail
-          test -f "qa_artifacts/.ai/dev/marker.txt" || (echo "Missing qa_artifacts/.ai/dev/marker.txt" && exit 1)
-          test -f "qa_artifacts/output/dev_patch/plan.md" || (echo "Missing qa_artifacts/output/dev_patch/plan.md" && exit 1)
-          echo "QA OK: marker + plan exist in artifacts"
+          ls -la qa_artifacts
+          test "$(find qa_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
+          echo "QA OK: issue summary exists"
