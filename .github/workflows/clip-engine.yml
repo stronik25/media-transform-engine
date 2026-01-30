@@ -1,0 +1,42 @@
+name: Clip Engine (ffmpeg) -> output/*
+
+on:
+  push:
+    paths:
+      - "input/video/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Run transform
+        env:
+          TARGET_SECONDS: "30"
+        run: |
+          chmod +x scripts/run_clip.sh
+          scripts/run_clip.sh
+
+      - name: Acceptance
+        env:
+          TARGET_SECONDS: "30"
+          EPS: "0.5"
+        run: |
+          chmod +x ci/accept.sh
+          bash ci/accept.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs
+          path: output/**
