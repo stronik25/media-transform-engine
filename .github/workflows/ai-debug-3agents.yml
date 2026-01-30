@@ -356,34 +356,56 @@ jobs:
           name: ai-debug-context
           path: output/context
 
+      - name: "Download preflight artifact (includes openai.config snapshot)"
+        uses: actions/download-artifact@v4
+        with:
+          name: preflight-out
+          path: output/preflight
+
       - name: "Download LIVE ARCH artifact"
         uses: actions/download-artifact@v4
         with:
           name: live-arch
           path: output/live/arch
 
-      - name: "Generate DEV live placeholder (no OpenAI yet)"
+      - name: "Run DEV (OpenAI Responses API)"
         shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p output/live/dev
-          ISSUE_NUM="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('number',''))")"
+
+          test -f output/preflight/openai.config.json
+          test -f output/live/arch/arch.md
+
+          MODEL="$(python3 .ai/scripts/read_role_config.py --cfg output/preflight/openai.config.json --role dev --field model)"
+          MOUT="$(python3 .ai/scripts/read_role_config.py --cfg output/preflight/openai.config.json --role dev --field max_output_tokens)"
+
+          ISSUE_NUM="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); v=d.get('number',''); print(v if v is not None else '')")"
           if [ -z "$ISSUE_NUM" ]; then
             ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
           fi
-          {
-            echo "# DEV (placeholder)"
-            echo ""
-            echo "Issue: $ISSUE_NUM"
-            echo "Input: output/live/arch/arch.md"
-            echo "Note: DEV OpenAI calls not implemented yet."
-          } > output/live/dev/dev.md
 
-          {
-            echo "# Issue $ISSUE_NUM (LIVE candidate placeholder)"
-            echo ""
-            echo "This file is a placeholder. Next step will generate real content via OpenAI (when enabled)."
-          } > output/live/dev/issue_${ISSUE_NUM}.md
+          TITLE="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('title',''))")"
+          BODY="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('body',''))")"
+          URL="$(python3 -c "import json; d=json.load(open('output/context/issue.json','r',encoding='utf-8')); print(d.get('html_url',''))")"
+
+          ARCH_PLAN="$(cat output/live/arch/arch.md)"
+
+          SYS="You are DEV. Produce a deterministic patch proposal in Markdown. No shell commands. No git. Output only Markdown for file .ai/dev/issue_<N>.md."
+          USR="Goal:\nGenerate the content of file: .ai/dev/issue_${ISSUE_NUM}.md\n\nInputs:\nURL: ${URL}\nTitle: ${TITLE}\nBody:\n${BODY}\n\nARCH plan:\n${ARCH_PLAN}\n\nRules:\n- Output MUST be valid Markdown.\n- Include: Summary, Proposed changes, Files to touch, Tests, Risks.\n- Do not include code blocks unless strictly necessary.\n- Keep it concise and actionable."
+
+          mkdir -p output/live/dev
+          python3 .ai/scripts/openai_call.py \
+            --model "$MODEL" \
+            --max_output_tokens "$MOUT" \
+            --system "$SYS" \
+            --user "$USR" \
+            --out_dir output/live/dev
+
+          # openai_call writes arch.md by design; rename to issue_<N>.md for DEV stage
+          test -f output/live/dev/arch.md
+          mv output/live/dev/arch.md "output/live/dev/issue_${ISSUE_NUM}.md"
 
       - name: "Upload LIVE DEV artifact"
         uses: actions/upload-artifact@v4
@@ -408,14 +430,14 @@ jobs:
           set -euo pipefail
           mkdir -p output/live/qa
 
-          test -f output/live/dev/dev.md
           test "$(find output/live/dev -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
+          test -f output/live/dev/response.json
 
           {
             echo "# QA LIVE report"
             echo ""
-            echo "PASS: artifact-only chain works."
-            echo "Note: DEV/QA OpenAI calls not implemented yet."
+            echo "PASS: DEV generated issue_*.md and response.json."
+            echo "Note: This QA checks artifacts only. No repo checkout."
           } > output/live/qa/report.md
 
       - name: "Upload LIVE QA artifact"
