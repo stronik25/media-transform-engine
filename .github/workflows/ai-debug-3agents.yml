@@ -110,7 +110,6 @@ jobs:
           set -euo pipefail
           mkdir -p output/dev_patch
 
-          # Stub patch plan
           {
             echo "# DEV Patch Plan (stub)"
             echo
@@ -124,7 +123,6 @@ jobs:
             echo "- Add parsing of issue.json -> derive concrete edits"
           } > output/dev_patch/plan.md
 
-          # Stub file change
           mkdir -p .ai/dev
           {
             echo "# ai-debug marker"
@@ -154,7 +152,6 @@ jobs:
           BR="${{ needs.preflight.outputs.branch_name }}"
           TITLE="ai-debug: issue #${{ needs.preflight.outputs.issue_num }}"
           BODY="Automated stub patch PR. Next iteration will apply real edits from issue context."
-          # create PR if not exists, else update
           gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
 
@@ -170,20 +167,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: dev
     steps:
-      - name: "Checkout"
-        uses: actions/checkout@v4
+      - name: "Download DEV artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: dev-out
+          path: qa_artifacts
 
-      - name: "QA checks"
+      - name: "QA checks (artifact-based)"
         shell: bash
         run: |
           set -euo pipefail
-          test -f ".ai/dev/marker.txt" || (echo "Missing .ai/dev/marker.txt" && exit 1)
-          echo "QA OK: marker exists"
-
-      - name: "List PRs (sanity)"
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh pr list --limit 10
+          test -f "qa_artifacts/.ai/dev/marker.txt" || (echo "Missing qa_artifacts/.ai/dev/marker.txt" && exit 1)
+          test -f "qa_artifacts/output/dev_patch/plan.md" || (echo "Missing qa_artifacts/output/dev_patch/plan.md" && exit 1)
+          echo "QA OK: marker + plan exist in artifacts"
