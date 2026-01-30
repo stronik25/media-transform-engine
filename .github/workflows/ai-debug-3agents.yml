@@ -175,12 +175,13 @@ jobs:
             exit 3
           fi
 
-          # Validate config structure + numeric fields (reads cap from ENV)
+          # Validate config structure + numeric fields, enforce per-role max_output_tokens <= workflow cap
           export MAX_OUT_TOK
-          python3 -c 'import json,os,sys
+          python3 -c 'import json,os
 cfg=json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
 roles=cfg.get("roles")
 if not isinstance(roles,dict): raise SystemExit("Config missing top-level key: roles")
+cap=int(os.environ["MAX_OUT_TOK"])
 for role in ("arch","dev","qa"):
   if role not in roles: raise SystemExit(f"Config missing role: {role}")
   r=roles[role]
@@ -188,7 +189,6 @@ for role in ("arch","dev","qa"):
     if k not in r: raise SystemExit(f"Config role {role} missing key: {k}")
   float(r["price_in_per_1k"]); float(r["price_out_per_1k"])
   mout=int(r["max_output_tokens"])
-  cap=int(os.environ["MAX_OUT_TOK"])
   if mout>cap: raise SystemExit(f"Config role {role} max_output_tokens exceeds cap: {mout} > {cap}")
 print("CONFIG_OK")' >/dev/null
 
@@ -196,6 +196,7 @@ print("CONFIG_OK")' >/dev/null
           COMM_BYTES="$(wc -c < "${OUTPUT_DIR}/context/comments.json")"
           TOTAL_BYTES="$((ISSUE_BYTES + COMM_BYTES))"
 
+          # Conservative estimate: tokens ~= bytes/3 + overhead; worst-case assume 3 calls (arch/dev/qa)
           EST_IN_TOK="$((TOTAL_BYTES / 3 + 800))"
           EST_TOTAL_IN_TOK="$((EST_IN_TOK * 3))"
 
@@ -232,11 +233,11 @@ print(f"{total:.6f}")')"
             echo "Budget fail: est_total_input_tokens ($EST_TOTAL_IN_TOK) > max_input_tokens ($MAX_IN_TOK)" >&2
           fi
 
-          python3 -c 'from decimal import Decimal; import os,sys
+          # Correct bash: pass env vars BEFORE the command
+          EST_TOTAL_USD="$EST_TOTAL_USD" MAX_USD="$MAX_USD" python3 -c 'from decimal import Decimal; import os,sys
 est=Decimal(os.environ["EST_TOTAL_USD"])
 mx=Decimal(os.environ["MAX_USD"])
-sys.exit(10 if est>mx else 0)' \
-          EST_TOTAL_USD="$EST_TOTAL_USD" MAX_USD="$MAX_USD" || {
+sys.exit(10 if est>mx else 0)' || {
             EXCEED=1
             echo "Budget fail: est_total_usd ($EST_TOTAL_USD) > max_usd ($MAX_USD)" >&2
           }
