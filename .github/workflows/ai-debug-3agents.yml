@@ -81,47 +81,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUTPUT_DIR}/context"
-          mkdir -p "${OUTPUT_DIR}/preflight"
+          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/preflight"
 
       - name: "Validate v5 inputs (strict parsing)"
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, sys
-
-          def die(msg):
-            print(msg, file=sys.stderr)
-            sys.exit(2)
-
-          def as_float(s, name):
-            try:
-              v=float(str(s).strip())
-            except Exception:
-              die(f"{name} must be a number, got: {s!r}")
-            if v <= 0:
-              die(f"{name} must be > 0, got: {v}")
-            return v
-
-          def as_int(s, name):
-            try:
-              v=int(str(s).strip())
-            except Exception:
-              die(f"{name} must be an int, got: {s!r}")
-            if v <= 0:
-              die(f"{name} must be > 0, got: {v}")
-            return v
-
-          as_float(os.environ["MAX_USD"], "live_max_usd")
-          as_int(os.environ["MAX_IN"], "live_max_input_tokens")
-          as_int(os.environ["MAX_OUT"], "live_max_output_tokens")
-          print("OK: v5 numeric inputs valid")
-          PY
         env:
           MAX_USD: ${{ inputs.live_max_usd }}
           MAX_IN: ${{ inputs.live_max_input_tokens }}
           MAX_OUT: ${{ inputs.live_max_output_tokens }}
+        run: |
+          set -euo pipefail
+          python3 -c $'import os,sys\n\
+def die(m):\n\
+  print(m,file=sys.stderr); sys.exit(2)\n\
+def as_float(s,n):\n\
+  try: v=float(str(s).strip())\n\
+  except: die(f\"{n} must be a number, got: {s!r}\")\n\
+  if v<=0: die(f\"{n} must be > 0, got: {v}\")\n\
+  return v\n\
+def as_int(s,n):\n\
+  try: v=int(str(s).strip())\n\
+  except: die(f\"{n} must be an int, got: {s!r}\")\n\
+  if v<=0: die(f\"{n} must be > 0, got: {v}\")\n\
+  return v\n\
+as_float(os.environ[\"MAX_USD\"],\"live_max_usd\")\n\
+as_int(os.environ[\"MAX_IN\"],\"live_max_input_tokens\")\n\
+as_int(os.environ[\"MAX_OUT\"],\"live_max_output_tokens\")\n\
+print(\"OK: v5 numeric inputs valid\")\n'
 
       - name: "Fetch issue context (title/body/comments)"
         shell: bash
@@ -190,68 +176,44 @@ jobs:
                 exit 3
               fi
 
-              # Validate config + enforce caps (fail-fast) WITHOUT any API calls.
-              python3 - <<'PY'
-              import json, os, sys
-
-              def die(msg, code=4):
-                print(msg, file=sys.stderr)
-                sys.exit(code)
-
-              cfg_path = os.path.join(os.environ["OUTPUT_DIR"], "preflight", "openai.config.json")
-              with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-
-              if not isinstance(cfg, dict):
-                die("Config must be a JSON object")
-
-              roles = cfg.get("roles")
-              if not isinstance(roles, dict):
-                die("Config missing top-level key: roles")
-
-              required_roles = ("arch", "dev", "qa")
-              required_keys = ("model", "price_in_per_1k", "price_out_per_1k", "max_output_tokens")
-
-              for r in required_roles:
-                if r not in roles or not isinstance(roles[r], dict):
-                  die(f"Config missing role: {r}")
-                for k in required_keys:
-                  if k not in roles[r]:
-                    die(f"Config missing key for role '{r}': {k}")
-
-              max_usd = float(os.environ["MAX_USD"])
-              max_in = int(os.environ["MAX_IN"])
-              max_out = int(os.environ["MAX_OUT"])
-              fail_on_cap = (str(os.environ["FAIL_ON_CAP"]).strip().lower() == "true")
-
-              est_usd = 0.0
-              for r in required_roles:
-                pin = float(roles[r]["price_in_per_1k"])
-                pout = float(roles[r]["price_out_per_1k"])
-                est_usd += (max_in / 1000.0) * pin + (max_out / 1000.0) * pout
-
-              rep = []
-              rep.append("run_live_requested=true")
-              rep.append("live_enabled_var=true")
-              rep.append(f"max_usd={max_usd}")
-              rep.append(f"max_input_tokens={max_in}")
-              rep.append(f"max_output_tokens_per_call={max_out}")
-              rep.append(f"estimated_usd_conservative={est_usd:.6f}")
-
-              rep_path = os.path.join(os.environ["OUTPUT_DIR"], "preflight", "report.txt")
-              with open(rep_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(rep) + "\n")
-
-              if est_usd > max_usd:
-                msg = f"Estimated USD {est_usd:.6f} exceeds cap {max_usd:.6f}"
-                if fail_on_cap:
-                  die(msg, code=5)
-                else:
-                  print("WARN:", msg, file=sys.stderr)
-
-              print("OK: LIVE config validated and caps checked (no API calls).")
-              PY
-              OUTPUT_DIR="${OUTPUT_DIR}" MAX_USD="${MAX_USD}" MAX_IN="${MAX_IN}" MAX_OUT="${MAX_OUT}" FAIL_ON_CAP="${FAIL_ON_CAP}" python3 -c "print('OK: python env wired')"
+              python3 -c $'import json,os,sys\n\
+def die(m,c=4):\n\
+  print(m,file=sys.stderr); sys.exit(c)\n\
+cfg_path=os.path.join(os.environ[\"OUTPUT_DIR\"],\"preflight\",\"openai.config.json\")\n\
+cfg=json.load(open(cfg_path,\"r\",encoding=\"utf-8\"))\n\
+if not isinstance(cfg,dict): die(\"Config must be a JSON object\")\n\
+roles=cfg.get(\"roles\")\n\
+if not isinstance(roles,dict): die(\"Config missing top-level key: roles\")\n\
+req_roles=(\"arch\",\"dev\",\"qa\")\n\
+req_keys=(\"model\",\"price_in_per_1k\",\"price_out_per_1k\",\"max_output_tokens\")\n\
+for r in req_roles:\n\
+  if r not in roles or not isinstance(roles[r],dict): die(f\"Config missing role: {r}\")\n\
+  for k in req_keys:\n\
+    if k not in roles[r]: die(f\"Config missing key for role \\'{r}\\': {k}\")\n\
+max_usd=float(os.environ[\"MAX_USD\"])\n\
+max_in=int(os.environ[\"MAX_IN\"])\n\
+max_out=int(os.environ[\"MAX_OUT\"])\n\
+fail_on_cap=str(os.environ[\"FAIL_ON_CAP\"]).strip().lower()==\"true\"\n\
+est=0.0\n\
+for r in req_roles:\n\
+  pin=float(roles[r][\"price_in_per_1k\"])\n\
+  pout=float(roles[r][\"price_out_per_1k\"])\n\
+  est += (max_in/1000.0)*pin + (max_out/1000.0)*pout\n\
+rep=[\n\
+  \"run_live_requested=true\",\n\
+  \"live_enabled_var=true\",\n\
+  f\"max_usd={max_usd}\",\n\
+  f\"max_input_tokens={max_in}\",\n\
+  f\"max_output_tokens_per_call={max_out}\",\n\
+  f\"estimated_usd_conservative={est:.6f}\",\n\
+]\n\
+rp=os.path.join(os.environ[\"OUTPUT_DIR\"],\"preflight\",\"report.txt\")\n\
+open(rp,\"w\",encoding=\"utf-8\").write(\"\\n\".join(rep)+\"\\n\")\n\
+if est>max_usd:\n\
+  msg=f\"Estimated USD {est:.6f} exceeds cap {max_usd:.6f}\"\n\
+  if fail_on_cap: die(msg,5)\n\
+  print(\"WARN:\",msg,file=sys.stderr)\n\
+print(\"OK: LIVE config validated and caps checked (no API calls).\")\n'
 
               NOTE="LIVE enabled and preflight OK."
               EFFECTIVE="true"
@@ -388,49 +350,32 @@ jobs:
           name: preflight-out
           path: output/preflight
 
-      - name: "ARCH call"
+      - name: "ARCH (OpenAI) -> response.json"
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LIVE_MAX_OUT: ${{ inputs.live_max_output_tokens }}
         run: |
           set -euo pipefail
+          test -n "${OPENAI_API_KEY}"
           test -f output/preflight/openai.config.json
           test -f output/context/issue.json
-          test -n "${OPENAI_API_KEY}"
 
-          python3 - <<'PY'
-          import json, os
+          mkdir -p output/live/arch
 
-          with open("output/preflight/openai.config.json","r",encoding="utf-8") as f:
-            cfg = json.load(f)
-          role = cfg["roles"]["arch"]
-          model = role["model"]
-          max_out = int(os.environ.get("LIVE_MAX_OUT","1200"))
-
-          with open("output/context/issue.json","r",encoding="utf-8") as f:
-            issue = json.load(f)
-
-          prompt = (
-            "You are ARCH. Produce JSON with keys: goals, risks, dev_tasks, qa_checks.\n"
-            f"Title: {issue.get('title','')}\n"
-            f"URL: {issue.get('html_url','')}\n"
-            f"Body:\n{issue.get('body','') or ''}\n"
-          )
-
-          payload = {
-            "model": model,
-            "input": [{
-              "role": "user",
-              "content": [{"type":"input_text","text": prompt}]
-            }],
-            "max_output_tokens": max_out
-          }
-
-          os.makedirs("output/live/arch", exist_ok=True)
-          with open("output/live/arch/request.json","w",encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2)
-          PY
+          python3 -c $'import json,os\n\
+cfg=json.load(open(\"output/preflight/openai.config.json\",\"r\",encoding=\"utf-8\"))\n\
+model=cfg[\"roles\"][\"arch\"][\"model\"]\n\
+max_out=int(os.environ.get(\"LIVE_MAX_OUT\",\"1200\"))\n\
+issue=json.load(open(\"output/context/issue.json\",\"r\",encoding=\"utf-8\"))\n\
+prompt=(\"You are ARCH. Produce JSON with keys: goals, risks, dev_tasks, qa_checks.\\n\"+\n\
+        f\"Title: {issue.get(\\\"title\\\",\\\"\\\")}\\n\"+\n\
+        f\"URL: {issue.get(\\\"html_url\\\",\\\"\\\")}\\n\"+\n\
+        f\"Body:\\n{issue.get(\\\"body\\\",\\\"\\\") or \\\"\\\"}\\n\")\n\
+payload={\"model\":model,\n\
+         \"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":prompt}]}],\n\
+         \"max_output_tokens\":max_out}\n\
+json.dump(payload,open(\"output/live/arch/request.json\",\"w\",encoding=\"utf-8\"),ensure_ascii=True,indent=2)\n'
 
           curl -sS https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -469,7 +414,7 @@ jobs:
           name: live-arch
           path: output/live/arch
 
-      - name: "DEV call + extract md"
+      - name: "DEV (OpenAI) -> issue_<N>.md"
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -477,48 +422,29 @@ jobs:
           ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
         run: |
           set -euo pipefail
+          test -n "${OPENAI_API_KEY}"
           test -f output/preflight/openai.config.json
           test -f output/context/issue.json
           test -f output/live/arch/response.json
-          test -n "${OPENAI_API_KEY}"
 
-          python3 - <<'PY'
-          import json, os
+          mkdir -p output/live/dev
 
-          with open("output/preflight/openai.config.json","r",encoding="utf-8") as f:
-            cfg = json.load(f)
-          role = cfg["roles"]["dev"]
-          model = role["model"]
-          max_out = int(os.environ.get("LIVE_MAX_OUT","1200"))
-
-          with open("output/context/issue.json","r",encoding="utf-8") as f:
-            issue = json.load(f)
-
-          with open("output/live/arch/response.json","r",encoding="utf-8") as f:
-            arch = json.load(f)
-
-          prompt = (
-            "You are DEV. Return plain markdown for .ai/dev/issue_<N>.md.\n"
-            "Use ARCH response as guidance.\n\n"
-            f"Title: {issue.get('title','')}\n"
-            f"URL: {issue.get('html_url','')}\n"
-            f"Body:\n{issue.get('body','') or ''}\n\n"
-            f"ARCH_JSON:\n{json.dumps(arch, ensure_ascii=True)}\n"
-          )
-
-          payload = {
-            "model": model,
-            "input": [{
-              "role": "user",
-              "content": [{"type":"input_text","text": prompt}]
-            }],
-            "max_output_tokens": max_out
-          }
-
-          os.makedirs("output/live/dev", exist_ok=True)
-          with open("output/live/dev/request.json","w",encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2)
-          PY
+          python3 -c $'import json,os\n\
+cfg=json.load(open(\"output/preflight/openai.config.json\",\"r\",encoding=\"utf-8\"))\n\
+model=cfg[\"roles\"][\"dev\"][\"model\"]\n\
+max_out=int(os.environ.get(\"LIVE_MAX_OUT\",\"1200\"))\n\
+issue=json.load(open(\"output/context/issue.json\",\"r\",encoding=\"utf-8\"))\n\
+arch=json.load(open(\"output/live/arch/response.json\",\"r\",encoding=\"utf-8\"))\n\
+prompt=(\"You are DEV. Return plain markdown for .ai/dev/issue_<N>.md.\\n\"+\n\
+        \"Use ARCH response as guidance.\\n\\n\"+\n\
+        f\"Title: {issue.get(\\\"title\\\",\\\"\\\")}\\n\"+\n\
+        f\"URL: {issue.get(\\\"html_url\\\",\\\"\\\")}\\n\"+\n\
+        f\"Body:\\n{issue.get(\\\"body\\\",\\\"\\\") or \\\"\\\"}\\n\\n\"+\n\
+        f\"ARCH_JSON:\\n{json.dumps(arch,ensure_ascii=True)}\\n\")\n\
+payload={\"model\":model,\n\
+         \"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":prompt}]}],\n\
+         \"max_output_tokens\":max_out}\n\
+json.dump(payload,open(\"output/live/dev/request.json\",\"w\",encoding=\"utf-8\"),ensure_ascii=True,indent=2)\n'
 
           curl -sS https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -528,36 +454,26 @@ jobs:
 
           test -s output/live/dev/response.json
 
-          python3 - <<'PY'
-          import json, os
-
-          issue_num = os.environ["ISSUE_NUM"]
-          with open("output/live/dev/response.json","r",encoding="utf-8") as f:
-            resp = json.load(f)
-
-          md = None
-          out = resp.get("output")
-          if isinstance(out, list):
-            texts = []
-            for item in out:
-              content = item.get("content")
-              if isinstance(content, list):
-                for c in content:
-                  t = c.get("type")
-                  if t in ("output_text","text") and isinstance(c.get("text"), str):
-                    texts.append(c["text"])
-            if texts:
-              md = "\n".join(texts).strip()
-
-          if not md:
-            md = json.dumps(resp, ensure_ascii=False, indent=2)
-
-          os.makedirs("output/live/dev", exist_ok=True)
-          p = f"output/live/dev/issue_{issue_num}.md"
-          with open(p, "w", encoding="utf-8") as f:
-            f.write(md + "\n")
-          print("Wrote", p)
-          PY
+          python3 -c $'import json,os\n\
+issue_num=os.environ[\"ISSUE_NUM\"]\n\
+resp=json.load(open(\"output/live/dev/response.json\",\"r\",encoding=\"utf-8\"))\n\
+md=None\n\
+out=resp.get(\"output\")\n\
+if isinstance(out,list):\n\
+  texts=[]\n\
+  for item in out:\n\
+    content=item.get(\"content\")\n\
+    if isinstance(content,list):\n\
+      for c in content:\n\
+        t=c.get(\"type\")\n\
+        if t in (\"output_text\",\"text\") and isinstance(c.get(\"text\"),str):\n\
+          texts.append(c[\"text\"])\n\
+  if texts: md=\"\\n\".join(texts).strip()\n\
+if not md:\n\
+  md=json.dumps(resp,ensure_ascii=False,indent=2)\n\
+p=f\"output/live/dev/issue_{issue_num}.md\"\n\
+open(p,\"w\",encoding=\"utf-8\").write(md+\"\\n\")\n\
+print(\"Wrote\",p)\n'
 
       - name: "Upload LIVE DEV artifact"
         uses: actions/upload-artifact@v4
@@ -599,4 +515,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "apply_live_dev runs only when apply_live=true. Use manual apply-live.yml for production."
+          echo "apply_live_dev runs only when apply_live=true. Use apply-live.yml manual apply by run_id for production."
