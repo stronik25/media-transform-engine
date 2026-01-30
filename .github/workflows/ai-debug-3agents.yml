@@ -62,6 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           test -f ".ai/contract.md"
+          test -f ".ai/scripts/live_preflight.py"
 
       - name: "Prepare output dirs"
         shell: bash
@@ -175,59 +176,15 @@ jobs:
             exit 3
           fi
 
-          # Validate config in ONE LINE (prevents YAML indentation выпадение)
-          MAX_OUT_TOK="$MAX_OUT_TOK" python3 -c "import json,os; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); roles=cfg.get('roles'); \
-assert isinstance(roles,dict), 'Config missing top-level key: roles'; cap=int(os.environ['MAX_OUT_TOK']); \
-req=('arch','dev','qa'); keys=('model','price_in_per_1k','price_out_per_1k','max_output_tokens'); \
-[(__import__('builtins').None) for role in req if role not in roles and (_ for _ in ()).throw(SystemExit(f'Config missing role: {role}'))]; \
-[(__import__('builtins').None) for role in req for k in keys if k not in roles[role] and (_ for _ in ()).throw(SystemExit(f'Config role {role} missing key: {k}'))]; \
-[float(roles[role]['price_in_per_1k']) for role in req]; [float(roles[role]['price_out_per_1k']) for role in req]; \
-[ (int(roles[role]['max_output_tokens'])<=cap) or (_ for _ in ()).throw(SystemExit(f'Config role {role} max_output_tokens exceeds cap: {roles[role]['max_output_tokens']} > {cap}')) for role in req ]" >/dev/null
-
-          ISSUE_BYTES="$(wc -c < "${OUTPUT_DIR}/context/issue.json")"
-          COMM_BYTES="$(wc -c < "${OUTPUT_DIR}/context/comments.json")"
-          TOTAL_BYTES="$((ISSUE_BYTES + COMM_BYTES))"
-
-          EST_IN_TOK="$((TOTAL_BYTES / 3 + 800))"
-          EST_TOTAL_IN_TOK="$((EST_IN_TOK * 3))"
-
-          EST_IN_TOK="$EST_IN_TOK" python3 -c "import json,os; cfg=json.load(open('.ai/openai.config.json','r',encoding='utf-8')); roles=cfg['roles']; est=int(os.environ['EST_IN_TOK']); \
-def cost(role): r=roles[role]; pin=float(r['price_in_per_1k']); pout=float(r['price_out_per_1k']); mout=int(r['max_output_tokens']); return (est/1000.0)*pin + (mout/1000.0)*pout; \
-total=cost('arch')+cost('dev')+cost('qa'); print(f'{total:.6f}')" > "${OUTPUT_DIR}/preflight/budget.txt"
-
-          EST_TOTAL_USD="$(cat "${OUTPUT_DIR}/preflight/budget.txt")"
-
-          {
-            echo "run_live_requested=$RUN_LIVE"
-            echo "live_enabled_var=$LIVE_ON"
-            echo "run_live_effective=true"
-            echo "issue_bytes=$ISSUE_BYTES"
-            echo "comments_bytes=$COMM_BYTES"
-            echo "total_bytes=$TOTAL_BYTES"
-            echo "est_input_tokens_per_call=$EST_IN_TOK"
-            echo "est_total_input_tokens=$EST_TOTAL_IN_TOK"
-            echo "max_input_tokens=$MAX_IN_TOK"
-            echo "est_total_usd=$EST_TOTAL_USD"
-            echo "max_usd=$MAX_USD"
-            echo "fail_on_budget_exceed=$FAIL_ON"
-          } > "${OUTPUT_DIR}/preflight/live_gate.txt"
-
-          EXCEED=0
-          if [ "$EST_TOTAL_IN_TOK" -gt "$MAX_IN_TOK" ]; then
-            EXCEED=1
-            echo "Budget fail: est_total_input_tokens ($EST_TOTAL_IN_TOK) > max_input_tokens ($MAX_IN_TOK)" >&2
-          fi
-
-          EST_TOTAL_USD="$EST_TOTAL_USD" MAX_USD="$MAX_USD" python3 -c "from decimal import Decimal; import os,sys; \
-est=Decimal(os.environ['EST_TOTAL_USD']); mx=Decimal(os.environ['MAX_USD']); sys.exit(10 if est>mx else 0)" || {
-            EXCEED=1
-            echo "Budget fail: est_total_usd ($EST_TOTAL_USD) > max_usd ($MAX_USD)" >&2
-          }
-
-          if [ "$EXCEED" -eq 1 ] && [ "$FAIL_ON" = "true" ]; then
-            echo "Fail-fast: LIVE budgets exceeded. No OpenAI calls executed." >&2
-            exit 5
-          fi
+          python3 .ai/scripts/live_preflight.py \
+            --cfg "$CFG" \
+            --issue_json "${OUTPUT_DIR}/context/issue.json" \
+            --comments_json "${OUTPUT_DIR}/context/comments.json" \
+            --max_out_tok "$MAX_OUT_TOK" \
+            --max_in_tok "$MAX_IN_TOK" \
+            --max_usd "$MAX_USD" \
+            --fail_on "$FAIL_ON" \
+            --out_dir "${OUTPUT_DIR}/preflight"
 
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
