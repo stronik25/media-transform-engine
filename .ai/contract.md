@@ -1,11 +1,11 @@
 # AI Debug Contract
 
-Goal: validate repo structure + simulate ARCH -> DEV -> QA pipeline.
+Goal:
+- Read issue + comments
+- Produce a DEV patch (safe stub) as a PR
+- QA validates files exist and PR was created
 
-Rules:
-- In dry-run mode, do not call any external LLM API.
-- Produce placeholder outputs into output/ as if each stage ran:
-  - output/arch_plan.md
-  - output/dev_patch.md
-  - output/qa_report.md
-- Workflow must succeed in dry-run if repo structure is correct.
+Outputs:
+- output/context/*
+- output/dev_patch/*
+- PR branch: ai-debug/issue-<N>
