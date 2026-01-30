@@ -284,3 +284,112 @@ jobs:
           ls -la qa_artifacts
           test "$(find qa_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
           echo "QA OK: issue summary exists"
+
+  arch_live:
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.run_live_effective == 'true'
+    steps:
+      - name: "Download context artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-debug-context
+          path: output/context
+
+      - name: "Generate ARCH live placeholder (no OpenAI yet)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/live/arch
+          ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
+          {
+            echo "# ARCH (placeholder)"
+            echo ""
+            echo "Issue: $ISSUE_NUM"
+            echo "Note: LIVE enabled, but OpenAI calls not implemented in this step."
+          } > output/live/arch/arch.md
+
+      - name: "Upload LIVE ARCH artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-arch
+          path: output/live/arch
+
+  dev_live:
+    runs-on: ubuntu-latest
+    needs: arch_live
+    if: needs.arch_live.result == 'success'
+    steps:
+      - name: "Download context artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-debug-context
+          path: output/context
+
+      - name: "Download LIVE ARCH artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: live-arch
+          path: output/live/arch
+
+      - name: "Generate DEV live placeholder (no OpenAI yet)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/live/dev
+          ISSUE_NUM="$(jq -r '.number // ""' output/context/issue.json 2>/dev/null || true)"
+          if [ -z "$ISSUE_NUM" ]; then
+            ISSUE_NUM="${{ needs.preflight.outputs.issue_num }}"
+          fi
+          {
+            echo "# DEV (placeholder)"
+            echo ""
+            echo "Issue: $ISSUE_NUM"
+            echo "Input: output/live/arch/arch.md"
+            echo "Note: LIVE enabled, but OpenAI calls not implemented in this step."
+          } > output/live/dev/dev.md
+
+          {
+            echo "# Issue $ISSUE_NUM (LIVE candidate placeholder)"
+            echo ""
+            echo "This file is a placeholder. Next step will generate real content via OpenAI (when enabled)."
+          } > output/live/dev/issue_${ISSUE_NUM}.md
+
+      - name: "Upload LIVE DEV artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-dev
+          path: output/live/dev
+
+  qa_live:
+    runs-on: ubuntu-latest
+    needs: dev_live
+    if: needs.dev_live.result == 'success'
+    steps:
+      - name: "Download LIVE DEV artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: live-dev
+          path: output/live/dev
+
+      - name: "QA LIVE checks (artifacts only)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/live/qa
+
+          test -f output/live/dev/dev.md
+          test "$(find output/live/dev -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
+
+          {
+            echo "# QA LIVE report"
+            echo ""
+            echo "PASS: placeholders exist and artifact-only chain works."
+            echo "Note: No OpenAI calls yet."
+          } > output/live/qa/report.md
+
+      - name: "Upload LIVE QA artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-qa
+          path: output/live/qa
