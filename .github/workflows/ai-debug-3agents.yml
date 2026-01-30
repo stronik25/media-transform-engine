@@ -1,4 +1,4 @@
-name: "AI Debug (v4: issue -> deterministic patch -> PR)"
+name: "AI Debug (v5: optional live gates; v4 deterministic stays default)"
 
 on:
   workflow_dispatch:
@@ -7,6 +7,26 @@ on:
         description: "Issue number (e.g. 1)"
         required: true
         default: "1"
+      run_live:
+        description: "Enable LIVE mode (OpenAI). Default false. Requires LIVE_ENABLED=true and valid config."
+        required: false
+        default: "false"
+      max_usd:
+        description: "LIVE budget cap in USD (fail-fast)."
+        required: false
+        default: "0.50"
+      max_input_tokens:
+        description: "LIVE total input token cap estimate (fail-fast)."
+        required: false
+        default: "12000"
+      max_output_tokens_per_call:
+        description: "LIVE per-call output token cap (fail-fast)."
+        required: false
+        default: "1200"
+      fail_on_budget_exceed:
+        description: "If true, preflight fails when estimates exceed caps."
+        required: false
+        default: "true"
 
 permissions:
   contents: write
@@ -23,6 +43,7 @@ jobs:
     outputs:
       issue_num: ${{ steps.vars.outputs.issue_num }}
       branch_name: ${{ steps.vars.outputs.branch_name }}
+      run_live_effective: ${{ steps.live_gate.outputs.run_live_effective }}
     steps:
       - name: "Resolve ISSUE_NUM + branch"
         id: vars
@@ -46,7 +67,52 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUTPUT_DIR}/context"
+          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/preflight"
+
+      - name: "Validate v5 inputs (strict parsing)"
+        id: v5_inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+          is_bool() { [[ "$1" == "true" || "$1" == "false" ]]; }
+          is_money() { [[ "$1" =~ ^[0-9]+(\.[0-9]{1,4})?$ ]]; }
+
+          RUN_LIVE="${{ inputs.run_live }}"
+          MAX_USD="${{ inputs.max_usd }}"
+          MAX_IN_TOK="${{ inputs.max_input_tokens }}"
+          MAX_OUT_TOK="${{ inputs.max_output_tokens_per_call }}"
+          FAIL_ON="${{ inputs.fail_on_budget_exceed }}"
+
+          if ! is_bool "$RUN_LIVE"; then
+            echo "Invalid input run_live=$RUN_LIVE (must be true/false)" >&2
+            exit 2
+          fi
+          if ! is_money "$MAX_USD"; then
+            echo "Invalid input max_usd=$MAX_USD (must be numeric like 0.50)" >&2
+            exit 2
+          fi
+          if ! is_int "$MAX_IN_TOK"; then
+            echo "Invalid input max_input_tokens=$MAX_IN_TOK (must be integer)" >&2
+            exit 2
+          fi
+          if ! is_int "$MAX_OUT_TOK"; then
+            echo "Invalid input max_output_tokens_per_call=$MAX_OUT_TOK (must be integer)" >&2
+            exit 2
+          fi
+          if ! is_bool "$FAIL_ON"; then
+            echo "Invalid input fail_on_budget_exceed=$FAIL_ON (must be true/false)" >&2
+            exit 2
+          fi
+
+          {
+            echo "run_live=$RUN_LIVE"
+            echo "max_usd=$MAX_USD"
+            echo "max_input_tokens=$MAX_IN_TOK"
+            echo "max_output_tokens_per_call=$MAX_OUT_TOK"
+            echo "fail_on_budget_exceed=$FAIL_ON"
+          } > "${OUTPUT_DIR}/preflight/v5_inputs.txt"
 
       - name: "Fetch issue context (title/body/comments)"
         shell: bash
@@ -68,11 +134,175 @@ jobs:
                "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE/comments?per_page=100" \
             > "${OUTPUT_DIR}/context/comments.json"
 
+      - name: "LIVE gate + budget preflight (no OpenAI calls)"
+        id: live_gate
+        shell: bash
+        env:
+          LIVE_ENABLED: ${{ vars.LIVE_ENABLED }}
+        run: |
+          set -euo pipefail
+
+          RUN_LIVE="${{ inputs.run_live }}"
+          FAIL_ON="${{ inputs.fail_on_budget_exceed }}"
+          MAX_USD="${{ inputs.max_usd }}"
+          MAX_IN_TOK="${{ inputs.max_input_tokens }}"
+          MAX_OUT_TOK="${{ inputs.max_output_tokens_per_call }}"
+          LIVE_ON="${LIVE_ENABLED:-false}"
+          CFG=".ai/openai.config.json"
+
+          # Effective gating: must request run_live AND repo kill-switch must be true.
+          RUN_EFF="false"
+          if [ "$RUN_LIVE" = "true" ] && [ "$LIVE_ON" = "true" ]; then
+            RUN_EFF="true"
+          fi
+          echo "run_live_effective=$RUN_EFF" >> "$GITHUB_OUTPUT"
+
+          # If not effective, do not block v4. Still write a report.
+          if [ "$RUN_EFF" != "true" ]; then
+            {
+              echo "run_live_requested=$RUN_LIVE"
+              echo "live_enabled_var=$LIVE_ON"
+              echo "run_live_effective=false"
+              echo "note=LIVE not enabled (either run_live=false or LIVE_ENABLED!=true). No OpenAI will run."
+            } > "${OUTPUT_DIR}/preflight/live_gate.txt"
+            exit 0
+          fi
+
+          # LIVE requested+enabled: require config file and validate it.
+          if [ ! -f "$CFG" ]; then
+            echo "LIVE enabled but missing config: $CFG" >&2
+            exit 3
+          fi
+
+          python3 - << 'PY'
+import json, sys, os
+cfg_path = ".ai/openai.config.json"
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+def die(msg, code=4):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+for k in ("roles",):
+    if k not in cfg:
+        die(f"Config missing top-level key: {k}")
+
+roles = cfg["roles"]
+for role in ("arch","dev","qa"):
+    if role not in roles:
+        die(f"Config missing role: {role}")
+    r = roles[role]
+    for k in ("model","price_in_per_1k","price_out_per_1k","max_output_tokens"):
+        if k not in r:
+            die(f"Config role '{role}' missing key: {k}")
+    # numeric checks
+    try:
+        float(r["price_in_per_1k"])
+        float(r["price_out_per_1k"])
+        int(r["max_output_tokens"])
+    except Exception:
+        die(f"Config role '{role}' has invalid numeric values")
+
+print("CONFIG_OK=1")
+PY
+
+          # Conservative token estimation:
+          # - Take UTF-8 byte size of context files and approximate tokens.
+          # - tokens ~= bytes / 4 (rough). Use /3 to be more conservative (higher estimate).
+          ISSUE_BYTES="$(wc -c < "${OUTPUT_DIR}/context/issue.json")"
+          COMM_BYTES="$(wc -c < "${OUTPUT_DIR}/context/comments.json")"
+          TOTAL_BYTES="$((ISSUE_BYTES + COMM_BYTES))"
+
+          # Estimate input tokens (conservative): bytes/3 + fixed overhead per role.
+          EST_IN_TOK="$((TOTAL_BYTES / 3 + 800))"
+          # Total input across 3 calls (arch/dev/qa), assume same pack size each time (worst-case).
+          EST_TOTAL_IN_TOK="$((EST_IN_TOK * 3))"
+
+          python3 - << PY
+import json
+cfg = json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
+roles = cfg["roles"]
+max_out_cap = int("${MAX_OUT_TOK}")
+# enforce per-role max_output_tokens <= workflow cap
+for role in ("arch","dev","qa"):
+    if int(roles[role]["max_output_tokens"]) > max_out_cap:
+        raise SystemExit(f"Config role {role} max_output_tokens exceeds workflow cap: {roles[role]['max_output_tokens']} > {max_out_cap}")
+print("CAP_OK=1")
+PY
+
+          # Worst-case cost estimate:
+          # cost_role = (est_in_tok/1000)*price_in + (max_out_tok/1000)*price_out
+          python3 - << PY
+import json, math
+est_in_tok = int("${EST_IN_TOK}")
+cfg = json.load(open(".ai/openai.config.json","r",encoding="utf-8"))
+roles = cfg["roles"]
+
+def cost_for(role):
+    r = roles[role]
+    pin = float(r["price_in_per_1k"])
+    pout = float(r["price_out_per_1k"])
+    mout = int(r["max_output_tokens"])
+    return (est_in_tok/1000.0)*pin + (mout/1000.0)*pout
+
+total = sum(cost_for(r) for r in ("arch","dev","qa"))
+print(f"EST_IN_TOK_PER_CALL={est_in_tok}")
+print(f"EST_TOTAL_USD={total:.6f}")
+PY > "${OUTPUT_DIR}/preflight/budget.txt"
+
+          EST_TOTAL_USD="$(awk -F= '/^EST_TOTAL_USD=/{print $2}' "${OUTPUT_DIR}/preflight/budget.txt")"
+
+          {
+            echo "run_live_requested=$RUN_LIVE"
+            echo "live_enabled_var=$LIVE_ON"
+            echo "run_live_effective=true"
+            echo "issue_bytes=$ISSUE_BYTES"
+            echo "comments_bytes=$COMM_BYTES"
+            echo "total_bytes=$TOTAL_BYTES"
+            echo "est_input_tokens_per_call=$EST_IN_TOK"
+            echo "est_total_input_tokens=$EST_TOTAL_IN_TOK"
+            echo "max_input_tokens=$MAX_IN_TOK"
+            echo "est_total_usd=$EST_TOTAL_USD"
+            echo "max_usd=$MAX_USD"
+            echo "fail_on_budget_exceed=$FAIL_ON"
+          } > "${OUTPUT_DIR}/preflight/live_gate.txt"
+
+          # Budget enforcement
+          EXCEED=0
+          if [ "$EST_TOTAL_IN_TOK" -gt "$MAX_IN_TOK" ]; then
+            EXCEED=1
+            echo "Budget fail: est_total_input_tokens ($EST_TOTAL_IN_TOK) > max_input_tokens ($MAX_IN_TOK)" >&2
+          fi
+
+          python3 - << PY
+from decimal import Decimal
+est = Decimal("${EST_TOTAL_USD}")
+mx = Decimal("${MAX_USD}")
+import sys
+if est > mx:
+    sys.exit(10)
+PY || {
+            EXCEED=1
+            echo "Budget fail: est_total_usd ($EST_TOTAL_USD) > max_usd ($MAX_USD)" >&2
+          }
+
+          if [ "$EXCEED" -eq 1 ] && [ "$FAIL_ON" = "true" ]; then
+            echo "Fail-fast: LIVE budgets exceeded. No OpenAI calls executed." >&2
+            exit 5
+          fi
+
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
         with:
           name: ai-debug-context
           path: ${{ env.OUTPUT_DIR }}/context
+
+      - name: "Upload preflight report artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-out
+          path: ${{ env.OUTPUT_DIR }}/preflight
 
   dev:
     runs-on: ubuntu-latest
@@ -103,7 +333,6 @@ jobs:
           USER="$(jq -r '.user.login // ""' output/context/issue.json)"
           CREATED="$(jq -r '.created_at // ""' output/context/issue.json)"
 
-          # Keep it deterministic, avoid heredoc pitfalls: use printf line-by-line.
           OUT=".ai/dev/issue_${ISSUE_NUM}.md"
           : > "$OUT"
           printf "# Issue %s\n\n" "$ISSUE_NUM" >> "$OUT"
