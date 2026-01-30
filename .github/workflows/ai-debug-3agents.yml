@@ -1,4 +1,4 @@
-name: "AI Debug (v2: issue -> artifacts)"
+name: "AI Debug (v3: issue -> dev patch -> PR)"
 
 on:
   workflow_dispatch:
@@ -9,33 +9,44 @@ on:
         default: "1"
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
   issues: read
 
 env:
   OUTPUT_DIR: output
+  BRANCH_PREFIX: ai-debug/issue-
 
 jobs:
   preflight:
     runs-on: ubuntu-latest
     outputs:
       issue_num: ${{ steps.vars.outputs.issue_num }}
+      branch_name: ${{ steps.vars.outputs.branch_name }}
     steps:
-      - name: "Resolve ISSUE_NUM"
+      - name: "Resolve ISSUE_NUM + branch"
         id: vars
         shell: bash
         run: |
           set -euo pipefail
-          echo "issue_num=${{ inputs.issue }}" >> "$GITHUB_OUTPUT"
+          ISSUE="${{ inputs.issue }}"
+          echo "issue_num=$ISSUE" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${{ env.BRANCH_PREFIX }}$ISSUE" >> "$GITHUB_OUTPUT"
 
       - name: "Checkout"
         uses: actions/checkout@v4
+
+      - name: "Validate repo structure"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ".ai/contract.md"
 
       - name: "Prepare output dirs"
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUTPUT_DIR}"
+          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/dev_patch"
 
       - name: "Fetch issue context (title/body/comments)"
         shell: bash
@@ -47,23 +58,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Title + body
           curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/vnd.github+json" \
                "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE" \
-            > "${OUTPUT_DIR}/issue.json"
+            > "${OUTPUT_DIR}/context/issue.json"
 
-          # Comments (may be empty)
           curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/vnd.github+json" \
                "https://api.github.com/repos/$OWNER/$REPO/issues/$ISSUE/comments?per_page=100" \
-            > "${OUTPUT_DIR}/comments.json"
+            > "${OUTPUT_DIR}/context/comments.json"
 
       - name: "Build context markdown"
         shell: bash
         run: |
           set -euo pipefail
-
           {
             echo "# AI Debug Context"
             echo
@@ -72,84 +80,110 @@ jobs:
             echo "Run: ${{ github.run_id }}"
             echo "SHA: ${{ github.sha }}"
             echo
-            echo "## Files"
-            echo "- output/issue.json"
-            echo "- output/comments.json"
-          } > "${OUTPUT_DIR}/context.md"
+            echo "## Contract"
+            echo
+            sed -n '1,200p' .ai/contract.md
+          } > "${OUTPUT_DIR}/context/context.md"
 
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
         with:
           name: ai-debug-context
-          path: ${{ env.OUTPUT_DIR }}
+          path: ${{ env.OUTPUT_DIR }}/context
 
-  arch:
+  dev:
     runs-on: ubuntu-latest
     needs: preflight
     steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
       - name: "Download context artifact"
         uses: actions/download-artifact@v4
         with:
           name: ai-debug-context
-          path: output
+          path: output/context
 
-      - name: "ARCH placeholder (reads context)"
+      - name: "Create DEV patch (stub)"
         shell: bash
         run: |
           set -euo pipefail
-          echo "ARCH stage placeholder"
-          ls -la output
-          echo "---- context.md ----"
-          sed -n '1,120p' output/context.md
+          mkdir -p output/dev_patch
 
-      - name: "Upload ARCH artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: arch-out
-          path: output
+          # Stub patch plan
+          {
+            echo "# DEV Patch Plan (stub)"
+            echo
+            echo "Issue: #${{ needs.preflight.outputs.issue_num }}"
+            echo
+            echo "## What this does"
+            echo "- Creates a safe placeholder file so PR wiring is proven"
+            echo "- Next iteration will generate real changes based on issue context"
+            echo
+            echo "## Next steps"
+            echo "- Add parsing of issue.json -> derive concrete edits"
+          } > output/dev_patch/plan.md
 
-  dev:
-    runs-on: ubuntu-latest
-    needs: arch
-    steps:
-      - name: "Download ARCH artifact"
-        uses: actions/download-artifact@v4
-        with:
-          name: arch-out
-          path: output
+          # Stub file change
+          mkdir -p .ai/dev
+          {
+            echo "# ai-debug marker"
+            echo "issue=${{ needs.preflight.outputs.issue_num }}"
+            echo "run=${{ github.run_id }}"
+          } > .ai/dev/marker.txt
 
-      - name: "DEV placeholder"
+      - name: "Commit to branch"
         shell: bash
         run: |
           set -euo pipefail
-          echo "DEV stage placeholder"
-          ls -la output
+          BR="${{ needs.preflight.outputs.branch_name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BR"
+          git add .ai/dev/marker.txt output/dev_patch/plan.md
+          git commit -m "ai-debug: stub patch for issue #${{ needs.preflight.outputs.issue_num }}" || true
+          git push -u origin "$BR" --force
+
+      - name: "Create/Update PR"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BR="${{ needs.preflight.outputs.branch_name }}"
+          TITLE="ai-debug: issue #${{ needs.preflight.outputs.issue_num }}"
+          BODY="Automated stub patch PR. Next iteration will apply real edits from issue context."
+          # create PR if not exists, else update
+          gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
 
       - name: "Upload DEV artifact"
         uses: actions/upload-artifact@v4
         with:
           name: dev-out
-          path: output
+          path: |
+            output/dev_patch
+            .ai/dev/marker.txt
 
   qa:
     runs-on: ubuntu-latest
     needs: dev
     steps:
-      - name: "Download DEV artifact"
-        uses: actions/download-artifact@v4
-        with:
-          name: dev-out
-          path: output
+      - name: "Checkout"
+        uses: actions/checkout@v4
 
-      - name: "QA placeholder"
+      - name: "QA checks"
         shell: bash
         run: |
           set -euo pipefail
-          echo "QA stage placeholder"
-          ls -la output
+          test -f ".ai/dev/marker.txt" || (echo "Missing .ai/dev/marker.txt" && exit 1)
+          echo "QA OK: marker exists"
 
-      - name: "Upload QA artifact"
-        uses: actions/upload-artifact@v4
-        with:
-          name: qa-out
-          path: output
+      - name: "List PRs (sanity)"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh pr list --limit 10
