@@ -52,10 +52,16 @@ jobs:
     outputs:
       issue_num: ${{ steps.vars.outputs.issue_num }}
       branch_name: ${{ steps.vars.outputs.branch_name }}
+
       run_live_requested: ${{ steps.live_gate.outputs.run_live_requested }}
-      live_enabled_var: ${{ steps.live_gate.outputs.live_enabled_var }}
-      run_live_effective: ${{ steps.live_gate.outputs.run_live_effective }}
+      run_live_requested_raw: ${{ steps.live_gate.outputs.run_live_requested_raw }}
       apply_live_requested: ${{ steps.live_gate.outputs.apply_live_requested }}
+      apply_live_requested_raw: ${{ steps.live_gate.outputs.apply_live_requested_raw }}
+
+      live_enabled_var: ${{ steps.live_gate.outputs.live_enabled_var }}
+      live_enabled_var_raw: ${{ steps.live_gate.outputs.live_enabled_var_raw }}
+
+      run_live_effective: ${{ steps.live_gate.outputs.run_live_effective }}
       preflight_note: ${{ steps.live_gate.outputs.preflight_note }}
 
     steps:
@@ -81,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/preflight"
+          mkdir -p "${OUTPUT_DIR}/context" "${OUTPUT_DIR}/preflight" "${OUTPUT_DIR}/tmp"
 
       - name: "Validate v5 inputs (strict parsing)"
         shell: bash
@@ -91,23 +97,26 @@ jobs:
           MAX_OUT: ${{ inputs.live_max_output_tokens }}
         run: |
           set -euo pipefail
-          python3 -c $'import os,sys\n\
-def die(m):\n\
-  print(m,file=sys.stderr); sys.exit(2)\n\
-def as_float(s,n):\n\
-  try: v=float(str(s).strip())\n\
-  except: die(f\"{n} must be a number, got: {s!r}\")\n\
-  if v<=0: die(f\"{n} must be > 0, got: {v}\")\n\
-  return v\n\
-def as_int(s,n):\n\
-  try: v=int(str(s).strip())\n\
-  except: die(f\"{n} must be an int, got: {s!r}\")\n\
-  if v<=0: die(f\"{n} must be > 0, got: {v}\")\n\
-  return v\n\
-as_float(os.environ[\"MAX_USD\"],\"live_max_usd\")\n\
-as_int(os.environ[\"MAX_IN\"],\"live_max_input_tokens\")\n\
-as_int(os.environ[\"MAX_OUT\"],\"live_max_output_tokens\")\n\
-print(\"OK: v5 numeric inputs valid\")\n'
+
+          die() { echo "ERROR: $1" >&2; exit 2; }
+
+          # float > 0
+          if ! printf "%s" "${MAX_USD}" | tr -d '[:space:]' | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
+            die "live_max_usd must be a number, got: ${MAX_USD}"
+          fi
+          python3 -c "import os,sys; v=float(os.environ['MAX_USD'].strip()); sys.exit(0 if v>0 else 1)" || die "live_max_usd must be > 0, got: ${MAX_USD}"
+
+          # int > 0
+          if ! printf "%s" "${MAX_IN}" | tr -d '[:space:]' | grep -Eq '^[0-9]+$'; then
+            die "live_max_input_tokens must be an int, got: ${MAX_IN}"
+          fi
+          if ! printf "%s" "${MAX_OUT}" | tr -d '[:space:]' | grep -Eq '^[0-9]+$'; then
+            die "live_max_output_tokens must be an int, got: ${MAX_OUT}"
+          fi
+          [ "${MAX_IN}" -gt 0 ] || die "live_max_input_tokens must be > 0, got: ${MAX_IN}"
+          [ "${MAX_OUT}" -gt 0 ] || die "live_max_output_tokens must be > 0, got: ${MAX_OUT}"
+
+          echo "OK: v5 numeric inputs valid"
 
       - name: "Fetch issue context (title/body/comments)"
         shell: bash
@@ -148,6 +157,7 @@ print(\"OK: v5 numeric inputs valid\")\n'
           MAX_IN: ${{ inputs.live_max_input_tokens }}
           MAX_OUT: ${{ inputs.live_max_output_tokens }}
           FAIL_ON_CAP: ${{ inputs.live_fail_on_cap }}
+          OUTPUT_DIR: ${{ env.OUTPUT_DIR }}
         run: |
           set -euo pipefail
 
@@ -156,18 +166,25 @@ print(\"OK: v5 numeric inputs valid\")\n'
             if [ "$v" = "true" ]; then echo "true"; else echo "false"; fi
           }
 
-          RUN_LIVE="$(norm_bool "${RUN_LIVE_INPUT}")"
-          APPLY_LIVE="$(norm_bool "${APPLY_LIVE_INPUT}")"
-          LIVE_ENABLED="$(norm_bool "${LIVE_ENABLED_VAR}")"
+          RUN_LIVE_RAW="${RUN_LIVE_INPUT}"
+          APPLY_LIVE_RAW="${APPLY_LIVE_INPUT}"
+          LIVE_ENABLED_RAW="${LIVE_ENABLED_VAR}"
+
+          RUN_LIVE="$(norm_bool "${RUN_LIVE_RAW}")"
+          APPLY_LIVE="$(norm_bool "${APPLY_LIVE_RAW}")"
+          LIVE_ENABLED="$(norm_bool "${LIVE_ENABLED_RAW}")"
 
           EFFECTIVE="false"
           NOTE=""
+          REASON=""
 
           if [ "$RUN_LIVE" != "true" ]; then
             NOTE="LIVE not requested (run_live=false)."
+            REASON="run_live_false"
           else
             if [ "$LIVE_ENABLED" != "true" ]; then
               NOTE="LIVE requested but LIVE_ENABLED!=true (repo variable)."
+              REASON="live_enabled_not_true"
             else
               CFG="${OUTPUT_DIR}/preflight/openai.config.json"
               if [ ! -f "$CFG" ]; then
@@ -176,49 +193,60 @@ print(\"OK: v5 numeric inputs valid\")\n'
                 exit 3
               fi
 
-              python3 -c $'import json,os,sys\n\
-def die(m,c=4):\n\
-  print(m,file=sys.stderr); sys.exit(c)\n\
-cfg_path=os.path.join(os.environ[\"OUTPUT_DIR\"],\"preflight\",\"openai.config.json\")\n\
-cfg=json.load(open(cfg_path,\"r\",encoding=\"utf-8\"))\n\
-if not isinstance(cfg,dict): die(\"Config must be a JSON object\")\n\
-roles=cfg.get(\"roles\")\n\
-if not isinstance(roles,dict): die(\"Config missing top-level key: roles\")\n\
-req_roles=(\"arch\",\"dev\",\"qa\")\n\
-req_keys=(\"model\",\"price_in_per_1k\",\"price_out_per_1k\",\"max_output_tokens\")\n\
-for r in req_roles:\n\
-  if r not in roles or not isinstance(roles[r],dict): die(f\"Config missing role: {r}\")\n\
-  for k in req_keys:\n\
-    if k not in roles[r]: die(f\"Config missing key for role \\'{r}\\': {k}\")\n\
-max_usd=float(os.environ[\"MAX_USD\"])\n\
-max_in=int(os.environ[\"MAX_IN\"])\n\
-max_out=int(os.environ[\"MAX_OUT\"])\n\
-fail_on_cap=str(os.environ[\"FAIL_ON_CAP\"]).strip().lower()==\"true\"\n\
-est=0.0\n\
-for r in req_roles:\n\
-  pin=float(roles[r][\"price_in_per_1k\"])\n\
-  pout=float(roles[r][\"price_out_per_1k\"])\n\
-  est += (max_in/1000.0)*pin + (max_out/1000.0)*pout\n\
-rep=[\n\
-  \"run_live_requested=true\",\n\
-  \"live_enabled_var=true\",\n\
-  f\"max_usd={max_usd}\",\n\
-  f\"max_input_tokens={max_in}\",\n\
-  f\"max_output_tokens_per_call={max_out}\",\n\
-  f\"estimated_usd_conservative={est:.6f}\",\n\
-]\n\
-rp=os.path.join(os.environ[\"OUTPUT_DIR\"],\"preflight\",\"report.txt\")\n\
-open(rp,\"w\",encoding=\"utf-8\").write(\"\\n\".join(rep)+\"\\n\")\n\
-if est>max_usd:\n\
-  msg=f\"Estimated USD {est:.6f} exceeds cap {max_usd:.6f}\"\n\
-  if fail_on_cap: die(msg,5)\n\
-  print(\"WARN:\",msg,file=sys.stderr)\n\
-print(\"OK: LIVE config validated and caps checked (no API calls).\")\n'
+              # Build validator script without heredoc
+              PY="${OUTPUT_DIR}/tmp/validate_openai_config.py"
+              : > "$PY"
+              printf "%s\n" "import json,os,sys" >> "$PY"
+              printf "%s\n" "def die(m,c=4):" >> "$PY"
+              printf "%s\n" "  print(m,file=sys.stderr); sys.exit(c)" >> "$PY"
+              printf "%s\n" "od=os.environ['OUTPUT_DIR']" >> "$PY"
+              printf "%s\n" "cfg_path=os.path.join(od,'preflight','openai.config.json')" >> "$PY"
+              printf "%s\n" "cfg=json.load(open(cfg_path,'r',encoding='utf-8'))" >> "$PY"
+              printf "%s\n" "if not isinstance(cfg,dict): die('Config must be a JSON object')" >> "$PY"
+              printf "%s\n" "roles=cfg.get('roles')" >> "$PY"
+              printf "%s\n" "if not isinstance(roles,dict): die('Config missing top-level key: roles')" >> "$PY"
+              printf "%s\n" "req_roles=('arch','dev','qa')" >> "$PY"
+              printf "%s\n" "req_keys=('model','price_in_per_1k','price_out_per_1k','max_output_tokens')" >> "$PY"
+              printf "%s\n" "for r in req_roles:" >> "$PY"
+              printf "%s\n" "  if r not in roles or not isinstance(roles[r],dict): die(f'Config missing role: {r}')" >> "$PY"
+              printf "%s\n" "  for k in req_keys:" >> "$PY"
+              printf "%s\n" "    if k not in roles[r]: die(f\"Config missing key for role '{r}': {k}\")" >> "$PY"
+              printf "%s\n" "max_usd=float(os.environ['MAX_USD'])" >> "$PY"
+              printf "%s\n" "max_in=int(os.environ['MAX_IN'])" >> "$PY"
+              printf "%s\n" "max_out=int(os.environ['MAX_OUT'])" >> "$PY"
+              printf "%s\n" "fail_on_cap=str(os.environ.get('FAIL_ON_CAP','false')).strip().lower()=='true'" >> "$PY"
+              printf "%s\n" "est=0.0" >> "$PY"
+              printf "%s\n" "for r in req_roles:" >> "$PY"
+              printf "%s\n" "  pin=float(roles[r]['price_in_per_1k'])" >> "$PY"
+              printf "%s\n" "  pout=float(roles[r]['price_out_per_1k'])" >> "$PY"
+              printf "%s\n" "  est += (max_in/1000.0)*pin + (max_out/1000.0)*pout" >> "$PY"
+              printf "%s\n" "rp=os.path.join(od,'preflight','report.txt')" >> "$PY"
+              printf "%s\n" "lines=[" >> "$PY"
+              printf "%s\n" "  'run_live_requested=true'," >> "$PY"
+              printf "%s\n" "  'live_enabled_var=true'," >> "$PY"
+              printf "%s\n" "  f'max_usd={max_usd}'," >> "$PY"
+              printf "%s\n" "  f'max_input_tokens={max_in}'," >> "$PY"
+              printf "%s\n" "  f'max_output_tokens_per_call={max_out}'," >> "$PY"
+              printf "%s\n" "  f'estimated_usd_conservative={est:.6f}'," >> "$PY"
+              printf "%s\n" "]" >> "$PY"
+              printf "%s\n" "open(rp,'w',encoding='utf-8').write('\\n'.join(lines)+'\\n')" >> "$PY"
+              printf "%s\n" "if est>max_usd:" >> "$PY"
+              printf "%s\n" "  msg=f'Estimated USD {est:.6f} exceeds cap {max_usd:.6f}'" >> "$PY"
+              printf "%s\n" "  if fail_on_cap: die(msg,5)" >> "$PY"
+              printf "%s\n" "  print('WARN:',msg,file=sys.stderr)" >> "$PY"
+              printf "%s\n" "print('OK: LIVE config validated and caps checked (no API calls).')" >> "$PY"
+
+              python3 "$PY"
 
               NOTE="LIVE enabled and preflight OK."
+              REASON="live_ok"
               EFFECTIVE="true"
             fi
           fi
+
+          echo "run_live_requested_raw=${RUN_LIVE_RAW}" >> "$GITHUB_OUTPUT"
+          echo "apply_live_requested_raw=${APPLY_LIVE_RAW}" >> "$GITHUB_OUTPUT"
+          echo "live_enabled_var_raw=${LIVE_ENABLED_RAW}" >> "$GITHUB_OUTPUT"
 
           echo "run_live_requested=$RUN_LIVE" >> "$GITHUB_OUTPUT"
           echo "apply_live_requested=$APPLY_LIVE" >> "$GITHUB_OUTPUT"
@@ -227,11 +255,15 @@ print(\"OK: LIVE config validated and caps checked (no API calls).\")\n'
           echo "preflight_note=$NOTE" >> "$GITHUB_OUTPUT"
 
           {
-            echo "run_live_requested=$RUN_LIVE"
-            echo "live_enabled_var=$LIVE_ENABLED"
-            echo "run_live_effective=$EFFECTIVE"
-            echo "apply_live_requested=$APPLY_LIVE"
-            echo "note=$NOTE"
+            echo "run_live_input_raw=${RUN_LIVE_RAW}"
+            echo "apply_live_input_raw=${APPLY_LIVE_RAW}"
+            echo "live_enabled_var_raw=${LIVE_ENABLED_RAW}"
+            echo "run_live_input_norm=${RUN_LIVE}"
+            echo "apply_live_input_norm=${APPLY_LIVE}"
+            echo "live_enabled_var_norm=${LIVE_ENABLED}"
+            echo "run_live_effective=${EFFECTIVE}"
+            echo "reason=${REASON}"
+            echo "note=${NOTE}"
           } >> "${OUTPUT_DIR}/preflight/summary.txt"
 
       - name: "Upload context artifact"
@@ -361,21 +393,28 @@ print(\"OK: LIVE config validated and caps checked (no API calls).\")\n'
           test -f output/preflight/openai.config.json
           test -f output/context/issue.json
 
-          mkdir -p output/live/arch
+          mkdir -p output/live/arch output/tmp
 
-          python3 -c $'import json,os\n\
-cfg=json.load(open(\"output/preflight/openai.config.json\",\"r\",encoding=\"utf-8\"))\n\
-model=cfg[\"roles\"][\"arch\"][\"model\"]\n\
-max_out=int(os.environ.get(\"LIVE_MAX_OUT\",\"1200\"))\n\
-issue=json.load(open(\"output/context/issue.json\",\"r\",encoding=\"utf-8\"))\n\
-prompt=(\"You are ARCH. Produce JSON with keys: goals, risks, dev_tasks, qa_checks.\\n\"+\n\
-        f\"Title: {issue.get(\\\"title\\\",\\\"\\\")}\\n\"+\n\
-        f\"URL: {issue.get(\\\"html_url\\\",\\\"\\\")}\\n\"+\n\
-        f\"Body:\\n{issue.get(\\\"body\\\",\\\"\\\") or \\\"\\\"}\\n\")\n\
-payload={\"model\":model,\n\
-         \"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":prompt}]}],\n\
-         \"max_output_tokens\":max_out}\n\
-json.dump(payload,open(\"output/live/arch/request.json\",\"w\",encoding=\"utf-8\"),ensure_ascii=True,indent=2)\n'
+          PY="output/tmp/mk_arch_request.py"
+          : > "$PY"
+          printf "%s\n" "import json,os" >> "$PY"
+          printf "%s\n" "cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "model=cfg['roles']['arch']['model']" >> "$PY"
+          printf "%s\n" "max_out=int(os.environ.get('LIVE_MAX_OUT','1200'))" >> "$PY"
+          printf "%s\n" "issue=json.load(open('output/context/issue.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "title=issue.get('title','') or ''" >> "$PY"
+          printf "%s\n" "url=issue.get('html_url','') or ''" >> "$PY"
+          printf "%s\n" "body=issue.get('body','') or ''" >> "$PY"
+          printf "%s\n" "prompt=(" >> "$PY"
+          printf "%s\n" "  'You are ARCH. Produce JSON with keys: goals, risks, dev_tasks, qa_checks.\\n'" >> "$PY"
+          printf "%s\n" "  f'Title: {title}\\n'" >> "$PY"
+          printf "%s\n" "  f'URL: {url}\\n'" >> "$PY"
+          printf "%s\n" "  'Body:\\n' + body + '\\n'" >> "$PY"
+          printf "%s\n" ")" >> "$PY"
+          printf "%s\n" "payload={'model':model,'input':[{'role':'user','content':[{'type':'input_text','text':prompt}]}],'max_output_tokens':max_out}" >> "$PY"
+          printf "%s\n" "json.dump(payload,open('output/live/arch/request.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)" >> "$PY"
+
+          python3 "$PY"
 
           curl -sS https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -427,24 +466,31 @@ json.dump(payload,open(\"output/live/arch/request.json\",\"w\",encoding=\"utf-8\
           test -f output/context/issue.json
           test -f output/live/arch/response.json
 
-          mkdir -p output/live/dev
+          mkdir -p output/live/dev output/tmp
 
-          python3 -c $'import json,os\n\
-cfg=json.load(open(\"output/preflight/openai.config.json\",\"r\",encoding=\"utf-8\"))\n\
-model=cfg[\"roles\"][\"dev\"][\"model\"]\n\
-max_out=int(os.environ.get(\"LIVE_MAX_OUT\",\"1200\"))\n\
-issue=json.load(open(\"output/context/issue.json\",\"r\",encoding=\"utf-8\"))\n\
-arch=json.load(open(\"output/live/arch/response.json\",\"r\",encoding=\"utf-8\"))\n\
-prompt=(\"You are DEV. Return plain markdown for .ai/dev/issue_<N>.md.\\n\"+\n\
-        \"Use ARCH response as guidance.\\n\\n\"+\n\
-        f\"Title: {issue.get(\\\"title\\\",\\\"\\\")}\\n\"+\n\
-        f\"URL: {issue.get(\\\"html_url\\\",\\\"\\\")}\\n\"+\n\
-        f\"Body:\\n{issue.get(\\\"body\\\",\\\"\\\") or \\\"\\\"}\\n\\n\"+\n\
-        f\"ARCH_JSON:\\n{json.dumps(arch,ensure_ascii=True)}\\n\")\n\
-payload={\"model\":model,\n\
-         \"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":prompt}]}],\n\
-         \"max_output_tokens\":max_out}\n\
-json.dump(payload,open(\"output/live/dev/request.json\",\"w\",encoding=\"utf-8\"),ensure_ascii=True,indent=2)\n'
+          PY="output/tmp/mk_dev_request.py"
+          : > "$PY"
+          printf "%s\n" "import json,os" >> "$PY"
+          printf "%s\n" "cfg=json.load(open('output/preflight/openai.config.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "model=cfg['roles']['dev']['model']" >> "$PY"
+          printf "%s\n" "max_out=int(os.environ.get('LIVE_MAX_OUT','1200'))" >> "$PY"
+          printf "%s\n" "issue=json.load(open('output/context/issue.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "arch=json.load(open('output/live/arch/response.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "title=issue.get('title','') or ''" >> "$PY"
+          printf "%s\n" "url=issue.get('html_url','') or ''" >> "$PY"
+          printf "%s\n" "body=issue.get('body','') or ''" >> "$PY"
+          printf "%s\n" "prompt=(" >> "$PY"
+          printf "%s\n" "  'You are DEV. Return plain markdown for .ai/dev/issue_<N>.md.\\n'" >> "$PY"
+          printf "%s\n" "  'Use ARCH response as guidance.\\n\\n'" >> "$PY"
+          printf "%s\n" "  f'Title: {title}\\n'" >> "$PY"
+          printf "%s\n" "  f'URL: {url}\\n'" >> "$PY"
+          printf "%s\n" "  'Body:\\n' + body + '\\n\\n'" >> "$PY"
+          printf "%s\n" "  'ARCH_JSON:\\n' + json.dumps(arch,ensure_ascii=True) + '\\n'" >> "$PY"
+          printf "%s\n" ")" >> "$PY"
+          printf "%s\n" "payload={'model':model,'input':[{'role':'user','content':[{'type':'input_text','text':prompt}]}],'max_output_tokens':max_out}" >> "$PY"
+          printf "%s\n" "json.dump(payload,open('output/live/dev/request.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)" >> "$PY"
+
+          python3 "$PY"
 
           curl -sS https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -454,26 +500,30 @@ json.dump(payload,open(\"output/live/dev/request.json\",\"w\",encoding=\"utf-8\"
 
           test -s output/live/dev/response.json
 
-          python3 -c $'import json,os\n\
-issue_num=os.environ[\"ISSUE_NUM\"]\n\
-resp=json.load(open(\"output/live/dev/response.json\",\"r\",encoding=\"utf-8\"))\n\
-md=None\n\
-out=resp.get(\"output\")\n\
-if isinstance(out,list):\n\
-  texts=[]\n\
-  for item in out:\n\
-    content=item.get(\"content\")\n\
-    if isinstance(content,list):\n\
-      for c in content:\n\
-        t=c.get(\"type\")\n\
-        if t in (\"output_text\",\"text\") and isinstance(c.get(\"text\"),str):\n\
-          texts.append(c[\"text\"])\n\
-  if texts: md=\"\\n\".join(texts).strip()\n\
-if not md:\n\
-  md=json.dumps(resp,ensure_ascii=False,indent=2)\n\
-p=f\"output/live/dev/issue_{issue_num}.md\"\n\
-open(p,\"w\",encoding=\"utf-8\").write(md+\"\\n\")\n\
-print(\"Wrote\",p)\n'
+          PY2="output/tmp/extract_dev_md.py"
+          : > "$PY2"
+          printf "%s\n" "import json,os" >> "$PY2"
+          printf "%s\n" "issue_num=os.environ['ISSUE_NUM']" >> "$PY2"
+          printf "%s\n" "resp=json.load(open('output/live/dev/response.json','r',encoding='utf-8'))" >> "$PY2"
+          printf "%s\n" "md=None" >> "$PY2"
+          printf "%s\n" "out=resp.get('output')" >> "$PY2"
+          printf "%s\n" "if isinstance(out,list):" >> "$PY2"
+          printf "%s\n" "  texts=[]" >> "$PY2"
+          printf "%s\n" "  for item in out:" >> "$PY2"
+          printf "%s\n" "    content=item.get('content') if isinstance(item,dict) else None" >> "$PY2"
+          printf "%s\n" "    if isinstance(content,list):" >> "$PY2"
+          printf "%s\n" "      for c in content:" >> "$PY2"
+          printf "%s\n" "        if isinstance(c,dict) and c.get('type') in ('output_text','text') and isinstance(c.get('text'),str):" >> "$PY2"
+          printf "%s\n" "          texts.append(c['text'])" >> "$PY2"
+          printf "%s\n" "  if texts:" >> "$PY2"
+          printf "%s\n" "    md='\\n'.join(texts).strip()" >> "$PY2"
+          printf "%s\n" "if not md:" >> "$PY2"
+          printf "%s\n" "  md=json.dumps(resp,ensure_ascii=False,indent=2)" >> "$PY2"
+          printf "%s\n" "p=f'output/live/dev/issue_{issue_num}.md'" >> "$PY2"
+          printf "%s\n" "open(p,'w',encoding='utf-8').write(md+'\\n')" >> "$PY2"
+          printf "%s\n" "print('Wrote',p)" >> "$PY2"
+
+          python3 "$PY2"
 
       - name: "Upload LIVE DEV artifact"
         uses: actions/upload-artifact@v4
