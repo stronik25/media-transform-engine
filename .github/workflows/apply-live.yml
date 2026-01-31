@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Workflow run id of AI Debug run (e.g. 58). Use /actions/runs/<id>."
+        description: "Workflow run id (from URL /actions/runs/<id>, NOT the #run number)."
         required: true
         default: "0"
       issue:
-        description: "Issue number (e.g. 1). Used for target filename and branch naming."
+        description: "Issue number (e.g. 1). Used for expected filename and branch naming."
         required: true
         default: "1"
       target_base:
@@ -32,7 +32,6 @@ env:
   LIVE_DIR: "output/live/dev"
   DEV_DIR: ".ai/dev"
   BRANCH_PREFIX: "ai-live/issue-"
-  AI_DEBUG_WORKFLOW_FILE: "ai-debug-3agents.yml"
 
 jobs:
   apply:
@@ -47,7 +46,6 @@ jobs:
           DRY: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-
           die() { echo "ERROR: $1" >&2; exit 2; }
 
           r="$(printf "%s" "${RUN_ID}" | tr -d '[:space:]')"
@@ -70,6 +68,35 @@ jobs:
           echo "base=$b"
           echo "dry_run=$DRY"
 
+      - name: "List artifacts for run_id (debug)"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ env.OUTPUT_DIR }}"
+
+          url="https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100"
+          echo "Fetching artifacts list: $url"
+
+          curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/vnd.github+json" \
+               "$url" > "${{ env.OUTPUT_DIR }}/artifacts.json"
+
+          echo "Artifacts JSON saved to ${{ env.OUTPUT_DIR }}/artifacts.json"
+          echo "Artifacts summary:"
+          python3 -c "import json; d=json.load(open('${{ env.OUTPUT_DIR }}/artifacts.json','r',encoding='utf-8')); a=d.get('artifacts',[]); print('count=',len(a)); [print('-',x.get('name'), 'id=',x.get('id'), 'expired=',x.get('expired')) for x in a]"
+
+          # Fail fast if artifact name missing
+          python3 -c "import json,sys; d=json.load(open('${{ env.OUTPUT_DIR }}/artifacts.json','r',encoding='utf-8')); names=[x.get('name') for x in d.get('artifacts',[])]; sys.exit(0 if '${{ env.ARTIFACT_NAME }}' in names else 6)" || {
+            echo "ERROR: artifact '${{ env.ARTIFACT_NAME }}' not found for run_id=${RUN_ID}." >&2
+            echo "Hint: run_id must be the long number from /actions/runs/<id>, not the #run number." >&2
+            exit 6
+          }
+
       - name: "Checkout base branch"
         uses: actions/checkout@v4
         with:
@@ -90,15 +117,14 @@ jobs:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
-
           echo "Listing downloaded artifact:"
-          ls -la "${{ env.LIVE_DIR }}"
+          ls -la "${{ env.LIVE_DIR }}" || true
 
           FILE="${{ env.LIVE_DIR }}/issue_${ISSUE}.md"
           if [ ! -f "$FILE" ]; then
             echo "ERROR: expected file missing: $FILE" >&2
             echo "Found files:" >&2
-            find "${{ env.LIVE_DIR }}" -maxdepth 2 -type f -print >&2 || true
+            find "${{ env.LIVE_DIR }}" -maxdepth 3 -type f -print >&2 || true
             exit 3
           fi
 
@@ -127,6 +153,7 @@ jobs:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
+          mkdir -p "${{ env.OUTPUT_DIR }}"
           f="${{ env.DEV_DIR }}/issue_${ISSUE}.md"
           sha256sum "$f" | tee "${{ env.OUTPUT_DIR }}/apply_digest.txt"
           echo "Digest saved to ${{ env.OUTPUT_DIR }}/apply_digest.txt"
@@ -145,11 +172,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "$BR"
-          git add "${{ env.DEV_DIR }}/issue_${ISSUE}.md" "${{ env.OUTPUT_DIR }}/apply_digest.txt" || true
+          git add "${{ env.DEV_DIR }}/issue_${ISSUE}.md" "${{ env.OUTPUT_DIR }}/apply_digest.txt"
           git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}" || true
           git push -u origin "$BR" --force
-
-          echo "branch=$BR" >> "$GITHUB_OUTPUT"
 
       - name: "Create/Update PR"
         if: ${{ inputs.dry_run == false }}
