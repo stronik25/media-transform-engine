@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug workflow run_id to fetch artifact live-dev from"
+        description: "AI Debug workflow run id that produced artifact 'live-dev' (e.g. 21536204217)"
         required: true
         default: ""
       issue:
@@ -22,113 +22,92 @@ on:
         default: true
 
 permissions:
-  actions: read
   contents: write
   pull-requests: write
+  actions: read
 
 env:
   ARTIFACT_NAME: "live-dev"
-  OUT_DIR: "output/apply"
-  DEV_DIR: ".ai/dev"
+  OUTPUT_DIR: "output"
+  BRANCH_PREFIX: "ai-live/issue-"
 
 jobs:
   apply:
     runs-on: ubuntu-latest
-
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: "Validate inputs"
-        shell: bash
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-          BASE: ${{ inputs.base_branch }}
-          DRY: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          python3 -c "import os,sys,re; rid=os.environ['RUN_ID'].strip(); iss=os.environ['ISSUE'].strip(); base=os.environ['BASE'].strip(); \
-          (re.fullmatch(r'[0-9]{6,}', rid) or sys.exit('run_id must be digits')); \
-          (re.fullmatch(r'[0-9]+', iss) or sys.exit('issue must be digits')); \
-          (re.fullmatch(r'[A-Za-z0-9._/-]+', base) or sys.exit('base_branch has invalid chars')); \
-          print('OK inputs:', rid, iss, base, 'dry_run='+os.environ['DRY'])"
-
       - name: "Download LIVE DEV artifact from run_id"
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.OUT_DIR }}/live-dev
+          # IMPORTANT: download from a DIFFERENT workflow run
           run-id: ${{ inputs.run_id }}
           repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.OUTPUT_DIR }}/live-dev
 
       - name: "Validate artifact contents"
         shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
-          ls -la "${OUT_DIR}/live-dev"
-          test -f "${OUT_DIR}/live-dev/issue_${ISSUE}.md"
+          ls -la "${OUTPUT_DIR}/live-dev"
+          test -f "${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" || {
+            echo "Missing expected file: ${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" >&2
+            echo "Files present:" >&2
+            find "${OUTPUT_DIR}/live-dev" -maxdepth 2 -type f -print >&2
+            exit 2
+          }
+          echo "OK: expected issue markdown exists"
 
-      - name: "Compute digest (traceability)"
+      - name: "Materialize into repo (.ai/dev)"
         shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          mkdir -p "${OUT_DIR}"
-          sha256sum "${OUT_DIR}/live-dev/issue_${ISSUE}.md" | awk '{print $1}' > "${OUT_DIR}/apply_digest.txt"
-          printf "run_id=%s\nissue=%s\nsha256=%s\n" "${RUN_ID}" "${ISSUE}" "$(cat "${OUT_DIR}/apply_digest.txt")" > "${OUT_DIR}/apply_report.txt"
-          cat "${OUT_DIR}/apply_report.txt"
+          mkdir -p .ai/dev
+          cp -f "${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" ".ai/dev/issue_${{ inputs.issue }}.md"
 
-      - name: "Stage into repo working tree"
-        shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${DEV_DIR}"
-          cp "${OUT_DIR}/live-dev/issue_${ISSUE}.md" "${DEV_DIR}/issue_${ISSUE}.md"
-          mkdir -p "output"
-          cp "${OUT_DIR}/apply_digest.txt" "output/apply_digest.txt"
+          # Optional traceability file if exists in artifact
+          if [ -f "${OUTPUT_DIR}/live-dev/response.json" ]; then
+            mkdir -p "${OUTPUT_DIR}"
+            sha256sum "${OUTPUT_DIR}/live-dev/response.json" | awk '{print $1}' > "${OUTPUT_DIR}/apply_digest.txt"
+          else
+            echo "no-response-json" > "${OUTPUT_DIR}/apply_digest.txt"
+          fi
 
-      - name: "Dry-run stop (no push / no PR)"
+      - name: "Stop if dry_run=true"
         if: ${{ inputs.dry_run == true }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DRY RUN: validated + staged only. No git push, no PR."
+          echo "DRY RUN: validated and staged files, but will not push/PR."
+          echo "Staged file: .ai/dev/issue_${{ inputs.issue }}.md"
+          exit 0
 
-      - name: "Commit branch"
-        if: ${{ inputs.dry_run == false }}
+      - name: "Commit to branch"
         shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
+          BR="${BRANCH_PREFIX}${{ inputs.issue }}-run-${{ inputs.run_id }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "${BR}"
-          git add "${DEV_DIR}" "output/apply_digest.txt"
-          git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}" || true
-          git push -u origin "${BR}" --force
 
-      - name: "Create PR"
-        if: ${{ inputs.dry_run == false }}
+          git checkout -B "$BR"
+          git add .ai/dev "${OUTPUT_DIR}/apply_digest.txt" || true
+          git commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}" || true
+          git push -u origin "$BR" --force
+
+      - name: "Create/Update PR"
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
-          BASE: ${{ inputs.base_branch }}
         run: |
           set -euo pipefail
-          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          TITLE="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          BODY="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from workflow run ${RUN_ID}. Includes sha256 digest in output/apply_digest.txt."
-          gh pr create --base "${BASE}" --head "${BR}" --title "${TITLE}" --body "${BODY}" 2>/dev/null || \
-          gh pr edit "${BR}" --title "${TITLE}" --body "${BODY}"
+          BR="${BRANCH_PREFIX}${{ inputs.issue }}-run-${{ inputs.run_id }}"
+          BASE="${{ inputs.base_branch }}"
+          TITLE="ai-live: issue #${{ inputs.issue }} (run ${{ inputs.run_id }})"
+          BODY="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from workflow run ${{ inputs.run_id }}. Includes digest for traceability."
+
+          gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
