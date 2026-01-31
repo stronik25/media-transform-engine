@@ -1,4 +1,4 @@
-name: "AI LIVE trigger (label/comment -> dispatch AI Debug)"
+name: AI LIVE trigger (label/comment -> dispatch AI Debug)
 
 on:
   issues:
@@ -28,22 +28,15 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: "Extract event fields (safe, no multiline python)"
-        id: ev
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -c "import json,os; e=json.load(open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8')); g=lambda *p,default='': (lambda c: c if isinstance(c,str) else default)( (lambda cur: ( [ (cur:=cur.get(k) if isinstance(cur,dict) else None) for k in p ] and cur ) )(e) ) if (lambda cur: all(isinstance(cur,dict) and (k in cur) and not (cur:=cur[k]) is None for k in p[:-1]) and isinstance(cur,dict) and p[-1] in cur)(e) else default ); event=os.environ.get('GITHUB_EVENT_NAME',''); issue=str(e.get('issue',{}).get('number','')).strip(); label=str(e.get('label',{}).get('name','')).strip(); body=str(e.get('comment',{}).get('body','')).replace('\\r','').replace('\\n',' ').strip(); assoc=str(e.get('comment',{}).get('author_association','')).strip(); out=os.environ['GITHUB_OUTPUT']; open(out,'a',encoding='utf-8').write(f'event_name={event}\\nissue_num={issue}\\nlabel_name={label}\\ncomment_body={body}\\nauthor_assoc={assoc}\\n'); print('event_name=',event); print('issue_num=',issue); print('label_name=',label); print('author_assoc=',assoc)"
-
       - name: "Decide"
         id: decide
         shell: bash
         env:
-          EVENT_NAME: ${{ steps.ev.outputs.event_name }}
-          ISSUE_NUM: ${{ steps.ev.outputs.issue_num }}
-          LABEL_NAME: ${{ steps.ev.outputs.label_name }}
-          COMMENT_BODY: ${{ steps.ev.outputs.comment_body }}
-          AUTHOR_ASSOC: ${{ steps.ev.outputs.author_assoc }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
         run: |
           set -euo pipefail
 
@@ -58,7 +51,7 @@ jobs:
           fi
 
           if [ "${EVENT_NAME}" = "issues" ]; then
-            if [ "${LABEL_NAME}" = "${TRIGGER_LABEL}" ]; then
+            if [ "${LABEL_NAME:-}" = "${TRIGGER_LABEL}" ]; then
               should="true"
               reason="label"
             else
@@ -68,13 +61,13 @@ jobs:
           fi
 
           if [ "${EVENT_NAME}" = "issue_comment" ]; then
-            assoc="$(printf "%s" "${AUTHOR_ASSOC}" | tr '[:upper:]' '[:lower:]')"
+            assoc="$(printf "%s" "${AUTHOR_ASSOC:-}" | tr '[:upper:]' '[:lower:]')"
             case "${assoc}" in
               owner|member|collaborator) ;;
               *)
                 should="false"
                 reason="untrusted_author_association"
-                echo "Not dispatching: author_association=${AUTHOR_ASSOC}"
+                echo "Not dispatching: author_association=${AUTHOR_ASSOC:-}" >&2
                 echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
                 echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
                 echo "reason=${reason}" >> "$GITHUB_OUTPUT"
@@ -82,7 +75,7 @@ jobs:
                 ;;
             esac
 
-            body="$(printf "%s" "${COMMENT_BODY}" | tr -d '\r')"
+            body="$(printf "%s" "${COMMENT_BODY:-}" | tr -d '\r')"
             if printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+live(-run)?([[:space:]]|$)'; then
               should="true"
               reason="comment"
@@ -110,6 +103,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p output
+
           python3 -c "import json,os; payload={'ref':os.environ['REF'],'inputs':{'issue':os.environ['ISSUE_NUM'],'run_live':'true','apply_live':'false','live_max_usd':os.environ['DEFAULT_MAX_USD'],'live_max_input_tokens':os.environ['DEFAULT_MAX_IN'],'live_max_output_tokens':os.environ['DEFAULT_MAX_OUT'],'live_fail_on_cap':os.environ['DEFAULT_FAIL_ON_CAP']}}; json.dump(payload,open('output/dispatch.json','w',encoding='utf-8'),ensure_ascii=True,indent=2); print('Wrote output/dispatch.json')"
 
           api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
