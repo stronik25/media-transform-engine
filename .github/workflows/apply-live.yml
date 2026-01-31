@@ -1,201 +1,170 @@
-name: "Apply LIVE DEV artifact (manual, by run_id)"
+name: "AI LIVE trigger (label/comment -> dispatch AI Debug)"
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_id:
-        description: "Workflow run id (from URL /actions/runs/<id>, NOT the #run number)."
-        required: true
-        default: "0"
-      issue:
-        description: "Issue number (e.g. 1). Used for expected filename and branch naming."
-        required: true
-        default: "1"
-      target_base:
-        description: "Base branch for PR (usually main)."
-        required: true
-        default: "main"
-      dry_run:
-        description: "If true: validate only, do not push branch or create PR."
-        required: true
-        type: boolean
-        default: false
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
 
 permissions:
-  contents: write
-  pull-requests: write
-  actions: read
+  actions: write
+  issues: write
 
 env:
-  ARTIFACT_NAME: "live-dev"
-  OUTPUT_DIR: "output"
-  LIVE_DIR: "output/live/dev"
-  DEV_DIR: ".ai/dev"
-  BRANCH_PREFIX: "ai-live/issue-"
+  AI_DEBUG_WORKFLOW_FILE: "ai-debug-3agents.yml"
+  DEFAULT_MAX_USD: "0.50"
+  DEFAULT_MAX_IN: "12000"
+  DEFAULT_MAX_OUT: "1200"
+  DEFAULT_FAIL_ON_CAP: "true"
+  TRIGGER_LABEL: "ai-live"
 
 jobs:
-  apply:
+  dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: "Validate inputs (strict)"
+      - name: "Decide if we should dispatch"
+        id: decide
         shell: bash
         env:
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-          BASE: ${{ inputs.target_base }}
-          DRY: ${{ inputs.dry_run }}
+          EVENT_NAME: ${{ github.event_name }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
         run: |
           set -euo pipefail
-          die() { echo "ERROR: $1" >&2; exit 2; }
 
-          r="$(printf "%s" "${RUN_ID}" | tr -d '[:space:]')"
-          i="$(printf "%s" "${ISSUE}" | tr -d '[:space:]')"
-          b="$(printf "%s" "${BASE}" | tr -d '[:space:]')"
+          should="false"
+          reason=""
 
-          [ -n "$r" ] || die "run_id is required"
-          [ -n "$i" ] || die "issue is required"
-          [ -n "$b" ] || die "target_base is required"
+          if [ "${EVENT_NAME}" = "issues" ]; then
+            if [ "${LABEL_NAME}" = "${TRIGGER_LABEL}" ]; then
+              should="true"
+              reason="label"
+            else
+              reason="label_mismatch"
+            fi
+          fi
 
-          printf "%s" "$r" | grep -Eq '^[0-9]+$' || die "run_id must be numeric, got: ${RUN_ID}"
-          printf "%s" "$i" | grep -Eq '^[0-9]+$' || die "issue must be numeric, got: ${ISSUE}"
+          if [ "${EVENT_NAME}" = "issue_comment" ]; then
+            assoc="$(printf "%s" "${AUTHOR_ASSOC}" | tr '[:upper:]' '[:lower:]')"
+            case "${assoc}" in
+              owner|member|collaborator) ;;
+              *)
+                should="false"
+                reason="untrusted_author_association"
+                echo "Not dispatching: author_association=${AUTHOR_ASSOC}"
+                echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+                echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+                echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
 
-          [ "$r" -gt 0 ] || die "run_id must be > 0"
-          [ "$i" -gt 0 ] || die "issue must be > 0"
+            body="$(printf "%s" "${COMMENT_BODY}" | tr -d '\r')"
+            if printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+live(-run)?([[:space:]]|$)'; then
+              should="true"
+              reason="comment"
+            else
+              should="false"
+              reason="comment_no_match"
+            fi
+          fi
 
-          echo "OK: inputs validated"
-          echo "run_id=$r"
-          echo "issue=$i"
-          echo "base=$b"
-          echo "dry_run=$DRY"
+          echo "should_dispatch=${should}" >> "$GITHUB_OUTPUT"
+          echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
 
-      - name: "List artifacts for run_id (debug)"
+          echo "should_dispatch=${should}"
+          echo "issue_num=${ISSUE_NUM}"
+          echo "reason=${reason}"
+
+      - name: "Dispatch AI Debug (run_live=true, apply_live=false)"
+        id: dispatch_ai
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
-          RUN_ID: ${{ inputs.run_id }}
+          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
+          REF: "main"
         run: |
           set -euo pipefail
-          mkdir -p "${{ env.OUTPUT_DIR }}"
 
-          url="https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100"
-          echo "Fetching artifacts list: $url"
+          mkdir -p output
+          p="output/dispatch.json"
+          : > "$p"
+          printf "%s" "{" >> "$p"
+          printf "%s" "\"ref\":\"${REF}\"," >> "$p"
+          printf "%s" "\"inputs\":{" >> "$p"
+          printf "%s" "\"issue\":\"${ISSUE_NUM}\"," >> "$p"
+          printf "%s" "\"run_live\":\"true\"," >> "$p"
+          printf "%s" "\"apply_live\":\"false\"," >> "$p"
+          printf "%s" "\"live_max_usd\":\"${DEFAULT_MAX_USD}\"," >> "$p"
+          printf "%s" "\"live_max_input_tokens\":\"${DEFAULT_MAX_IN}\"," >> "$p"
+          printf "%s" "\"live_max_output_tokens\":\"${DEFAULT_MAX_OUT}\"," >> "$p"
+          printf "%s" "\"live_fail_on_cap\":\"${DEFAULT_FAIL_ON_CAP}\"" >> "$p"
+          printf "%s" "}}" >> "$p"
 
-          curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-               -H "Accept: application/vnd.github+json" \
-               "$url" > "${{ env.OUTPUT_DIR }}/artifacts.json"
+          api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
+          echo "Dispatching: ${api}"
+          code="$(curl -sS -o output/dispatch_response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${p}" \
+            "${api}")"
 
-          echo "Artifacts JSON saved to ${{ env.OUTPUT_DIR }}/artifacts.json"
-          echo "Artifacts summary:"
-          python3 -c "import json; d=json.load(open('${{ env.OUTPUT_DIR }}/artifacts.json','r',encoding='utf-8')); a=d.get('artifacts',[]); print('count=',len(a)); [print('-',x.get('name'), 'id=',x.get('id'), 'expired=',x.get('expired')) for x in a]"
-
-          # Fail fast if artifact name missing
-          python3 -c "import json,sys; d=json.load(open('${{ env.OUTPUT_DIR }}/artifacts.json','r',encoding='utf-8')); names=[x.get('name') for x in d.get('artifacts',[])]; sys.exit(0 if '${{ env.ARTIFACT_NAME }}' in names else 6)" || {
-            echo "ERROR: artifact '${{ env.ARTIFACT_NAME }}' not found for run_id=${RUN_ID}." >&2
-            echo "Hint: run_id must be the long number from /actions/runs/<id>, not the #run number." >&2
-            exit 6
-          }
-
-      - name: "Checkout base branch"
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.target_base }}
-          fetch-depth: 0
-
-      - name: "Download LIVE DEV artifact from run_id"
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.LIVE_DIR }}
-          run-id: ${{ inputs.run_id }}
-          github-token: ${{ github.token }}
-
-      - name: "Verify artifact contents"
-        shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-          echo "Listing downloaded artifact:"
-          ls -la "${{ env.LIVE_DIR }}" || true
-
-          FILE="${{ env.LIVE_DIR }}/issue_${ISSUE}.md"
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: expected file missing: $FILE" >&2
-            echo "Found files:" >&2
-            find "${{ env.LIVE_DIR }}" -maxdepth 3 -type f -print >&2 || true
-            exit 3
+          echo "http_code=${code}"
+          if [ "${code}" != "204" ]; then
+            echo "ERROR: dispatch failed (expected 204). Response body:" >&2
+            cat output/dispatch_response.txt >&2 || true
+            exit 7
           fi
 
-          if [ ! -s "$FILE" ]; then
-            echo "ERROR: expected file is empty: $FILE" >&2
-            exit 4
-          fi
+          echo "OK: dispatched AI Debug"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
 
-          echo "OK: artifact file present and non-empty: $FILE"
-
-      - name: "Stage into repo (.ai/dev)"
-        shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${{ env.DEV_DIR }}"
-          SRC="${{ env.LIVE_DIR }}/issue_${ISSUE}.md"
-          DST="${{ env.DEV_DIR }}/issue_${ISSUE}.md"
-          cp "$SRC" "$DST"
-          echo "Staged: $DST"
-
-      - name: "Compute digest (traceability)"
-        shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${{ env.OUTPUT_DIR }}"
-          f="${{ env.DEV_DIR }}/issue_${ISSUE}.md"
-          sha256sum "$f" | tee "${{ env.OUTPUT_DIR }}/apply_digest.txt"
-          echo "Digest saved to ${{ env.OUTPUT_DIR }}/apply_digest.txt"
-
-      - name: "Create branch + commit"
-        if: ${{ inputs.dry_run == false }}
-        shell: bash
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-          BR="${{ env.BRANCH_PREFIX }}${ISSUE}-run-${RUN_ID}"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git checkout -B "$BR"
-          git add "${{ env.DEV_DIR }}/issue_${ISSUE}.md" "${{ env.OUTPUT_DIR }}/apply_digest.txt"
-          git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}" || true
-          git push -u origin "$BR" --force
-
-      - name: "Create/Update PR"
-        if: ${{ inputs.dry_run == false }}
+      - name: "Comment back (always when dispatched)"
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-          BASE: ${{ inputs.target_base }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
+          REASON: ${{ steps.decide.outputs.reason }}
         run: |
           set -euo pipefail
-          BR="${{ env.BRANCH_PREFIX }}${ISSUE}-run-${RUN_ID}"
-          TITLE="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          BODY="Apply LIVE DEV artifact '${{ env.ARTIFACT_NAME }}' from workflow run ${RUN_ID}. Includes sha256 digest for traceability."
+          wf="https://github.com/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}"
+          msg="Dispatched AI Debug LIVE run (no apply). Trigger=${REASON}. Track runs: ${wf}. Next: run apply-live.yml by run_id after live-dev exists."
+          api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/comments"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"body\":\"${msg}\"}" \
+            "${api}"
 
-          gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
-          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
-
-      - name: "Upload apply report artifact (always)"
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: apply-live-report
-          path: ${{ env.OUTPUT_DIR }}
+      - name: "Remove label (one-shot arm)"
+        if: ${{ github.event_name == 'issues' && steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/labels/${TRIGGER_LABEL}"
+          echo "Removing label via: ${api}"
+          code="$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api}")"
+          if [ "${code}" != "200" && [ "${code}" != "204" ]; then
+            echo "WARN: failed to remove label (http ${code})" >&2
+          else
+            echo "OK: label removed"
+          fi
