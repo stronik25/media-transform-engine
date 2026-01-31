@@ -1,0 +1,132 @@
+name: "AI LIVE trigger (label/comment -> dispatch AI Debug)"
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  issues: write
+
+env:
+  AI_DEBUG_WORKFLOW_FILE: "ai-debug-3agents.yml"
+  DEFAULT_MAX_USD: "0.50"
+  DEFAULT_MAX_IN: "12000"
+  DEFAULT_MAX_OUT: "1200"
+  DEFAULT_FAIL_ON_CAP: "true"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Decide if we should dispatch"
+        id: decide
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_NUM_ISSUES: ${{ github.event.issue.number }}
+          ISSUE_NUM_COMMENT: ${{ github.event.issue.number }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+          SENDER_ASSOC: ${{ github.event.sender.type }}
+        run: |
+          set -euo pipefail
+
+          should="false"
+          issue_num=""
+
+          if [ "${EVENT_NAME}" = "issues" ]; then
+            if [ "${LABEL_NAME}" = "ai-live" ]; then
+              should="true"
+              issue_num="${ISSUE_NUM_ISSUES}"
+            fi
+          fi
+
+          if [ "${EVENT_NAME}" = "issue_comment" ]; then
+            # allow only trusted associations
+            assoc="$(printf "%s" "${AUTHOR_ASSOC}" | tr '[:upper:]' '[:lower:]')"
+            case "${assoc}" in
+              owner|member|collaborator) ;;
+              *)
+                echo "Not dispatching: author_association=${AUTHOR_ASSOC}"
+                should="false"
+                ;;
+            esac
+
+            if [ "${should}" != "false" ] || [ "${assoc}" = "owner" ] || [ "${assoc}" = "member" ] || [ "${assoc}" = "collaborator" ]; then
+              body="$(printf "%s" "${COMMENT_BODY}" | tr -d '\r')"
+              # command formats:
+              # /ai live
+              # /ai live-run
+              if printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+live(-run)?([[:space:]]|$)'; then
+                should="true"
+                issue_num="${ISSUE_NUM_COMMENT}"
+              fi
+            fi
+          fi
+
+          echo "should_dispatch=${should}" >> "$GITHUB_OUTPUT"
+          echo "issue_num=${issue_num}" >> "$GITHUB_OUTPUT"
+
+          echo "should_dispatch=${should}"
+          echo "issue_num=${issue_num}"
+
+      - name: "Dispatch AI Debug (run_live=true, apply_live=false)"
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
+          REF: "main"
+        run: |
+          set -euo pipefail
+
+          # Build JSON payload without heredoc
+          mkdir -p output
+          p="output/dispatch.json"
+          : > "$p"
+          printf "%s" "{" >> "$p"
+          printf "%s" "\"ref\":\"${REF}\"," >> "$p"
+          printf "%s" "\"inputs\":{" >> "$p"
+          printf "%s" "\"issue\":\"${ISSUE_NUM}\"," >> "$p"
+          printf "%s" "\"run_live\":\"true\"," >> "$p"
+          printf "%s" "\"apply_live\":\"false\"," >> "$p"
+          printf "%s" "\"live_max_usd\":\"${DEFAULT_MAX_USD}\"," >> "$p"
+          printf "%s" "\"live_max_input_tokens\":\"${DEFAULT_MAX_IN}\"," >> "$p"
+          printf "%s" "\"live_max_output_tokens\":\"${DEFAULT_MAX_OUT}\"," >> "$p"
+          printf "%s" "\"live_fail_on_cap\":\"${DEFAULT_FAIL_ON_CAP}\"" >> "$p"
+          printf "%s" "}}" >> "$p"
+
+          api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
+          echo "Dispatching: ${api}"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "@${p}" \
+            "${api}"
+
+      - name: "Comment back with link"
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' && github.event_name == 'issue_comment' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}"
+          msg="Dispatched AI Debug LIVE run (no apply). Track runs: ${url}"
+          api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/comments"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "{\"body\":\"${msg}\"}" \
+            "${api}"
