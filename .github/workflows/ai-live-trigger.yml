@@ -1,4 +1,4 @@
-name: "AI LIVE trigger (label/comment -> dispatch AI Debug, status)"
+name: "AI LIVE trigger (label/comment -> dispatch AI Debug)"
 
 on:
   issues:
@@ -17,105 +17,167 @@ env:
   DEFAULT_MAX_OUT: "1200"
   DEFAULT_FAIL_ON_CAP: "true"
   TRIGGER_LABEL: "ai-live"
+  REF: "main"
 
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+
+    # Anti-duplication: one in-flight per issue
+    concurrency:
+      group: ai-live-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+
     steps:
-      - name: "Decide action"
+      - name: "Parse event payload (safe)"
+        id: ev
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import json,os,sys
+p=os.environ['GITHUB_EVENT_PATH']
+e=json.load(open(p,'r',encoding='utf-8'))
+def g(*path, default=''):
+  cur=e
+  for k in path:
+    if isinstance(cur,dict) and k in cur: cur=cur[k]
+    else: return default
+  return cur
+issue_num=str(g('issue','number',default='')).strip()
+label_name=str(g('label','name',default='')).strip()
+comment_body=str(g('comment','body',default='')).replace('\r','').replace('\n',' ').strip()
+author_assoc=str(g('comment','author_association',default='')).strip()
+event_name=os.environ.get('GITHUB_EVENT_NAME','').strip()
+out=os.environ['GITHUB_OUTPUT']
+with open(out,'a',encoding='utf-8') as f:
+  f.write(f'event_name={event_name}\n')
+  f.write(f'issue_num={issue_num}\n')
+  f.write(f'label_name={label_name}\n')
+  f.write(f'comment_body={comment_body}\n')
+  f.write(f'author_assoc={author_assoc}\n')
+print('event_name=',event_name)
+print('issue_num=',issue_num)
+print('label_name=',label_name)
+print('author_assoc=',author_assoc)
+"
+
+      - name: "Decide if we should dispatch"
         id: decide
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          LABEL_NAME: ${{ github.event.label.name }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          ISSUE_NUM: ${{ github.event.issue.number }}
-          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+          EVENT_NAME: ${{ steps.ev.outputs.event_name }}
+          ISSUE_NUM: ${{ steps.ev.outputs.issue_num }}
+          LABEL_NAME: ${{ steps.ev.outputs.label_name }}
+          COMMENT_BODY: ${{ steps.ev.outputs.comment_body }}
+          AUTHOR_ASSOC: ${{ steps.ev.outputs.author_assoc }}
         run: |
           set -euo pipefail
 
-          action="none"   # dispatch | status | none
+          should="false"
           reason=""
-          issue_num="${ISSUE_NUM}"
 
-          # Label trigger -> dispatch
-          if [ "${EVENT_NAME}" = "issues" ] && [ "${LABEL_NAME}" = "${TRIGGER_LABEL}" ]; then
-            action="dispatch"
-            reason="label"
+          if [ -z "${ISSUE_NUM}" ]; then
+            echo "No issue number in payload; abort."
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            echo "issue_num=" >> "$GITHUB_OUTPUT"
+            echo "reason=no_issue" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          # Comment trigger
+          if [ "${EVENT_NAME}" = "issues" ]; then
+            if [ "${LABEL_NAME}" = "${TRIGGER_LABEL}" ]; then
+              should="true"
+              reason="label"
+            else
+              should="false"
+              reason="label_mismatch"
+            fi
+          fi
+
           if [ "${EVENT_NAME}" = "issue_comment" ]; then
             assoc="$(printf "%s" "${AUTHOR_ASSOC}" | tr '[:upper:]' '[:lower:]')"
-            case "${assoc}" in owner|member|collaborator) ;; *)
-              echo "Untrusted author_association=${AUTHOR_ASSOC}"
-              echo "action=none" >> "$GITHUB_OUTPUT"
-              echo "issue_num=${issue_num}" >> "$GITHUB_OUTPUT"
-              echo "reason=untrusted" >> "$GITHUB_OUTPUT"
-              exit 0
+            case "${assoc}" in
+              owner|member|collaborator) ;;
+              *)
+                should="false"
+                reason="untrusted_author_association"
+                echo "Not dispatching: author_association=${AUTHOR_ASSOC}"
+                echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+                echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+                echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
             esac
 
             body="$(printf "%s" "${COMMENT_BODY}" | tr -d '\r')"
             if printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+live(-run)?([[:space:]]|$)'; then
-              action="dispatch"
+              should="true"
               reason="comment"
-            elif printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+status([[:space:]]|$)'; then
-              action="status"
-              reason="status"
+            else
+              should="false"
+              reason="comment_no_match"
             fi
           fi
 
-          echo "action=${action}" >> "$GITHUB_OUTPUT"
-          echo "issue_num=${issue_num}" >> "$GITHUB_OUTPUT"
+          echo "should_dispatch=${should}" >> "$GITHUB_OUTPUT"
+          echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
-          echo "action=${action} issue=${issue_num} reason=${reason}"
+
+          echo "should_dispatch=${should}"
+          echo "issue_num=${ISSUE_NUM}"
+          echo "reason=${reason}"
 
       - name: "Dispatch AI Debug (run_live=true, apply_live=false)"
         id: dispatch_ai
-        if: ${{ steps.decide.outputs.action == 'dispatch' }}
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
-          REF: "main"
         run: |
           set -euo pipefail
 
           mkdir -p output
-          p="output/dispatch.json"
-          : > "$p"
-          printf "%s" "{" >> "$p"
-          printf "%s" "\"ref\":\"${REF}\"," >> "$p"
-          printf "%s" "\"inputs\":{" >> "$p"
-          printf "%s" "\"issue\":\"${ISSUE_NUM}\"," >> "$p"
-          printf "%s" "\"run_live\":\"true\"," >> "$p"
-          printf "%s" "\"apply_live\":\"false\"," >> "$p"
-          printf "%s" "\"live_max_usd\":\"${DEFAULT_MAX_USD}\"," >> "$p"
-          printf "%s" "\"live_max_input_tokens\":\"${DEFAULT_MAX_IN}\"," >> "$p"
-          printf "%s" "\"live_max_output_tokens\":\"${DEFAULT_MAX_OUT}\"," >> "$p"
-          printf "%s" "\"live_fail_on_cap\":\"${DEFAULT_FAIL_ON_CAP}\"" >> "$p"
-          printf "%s" "}}" >> "$p"
+          python3 -c "import json,os
+payload={
+  'ref': os.environ['REF'],
+  'inputs':{
+    'issue': os.environ['ISSUE_NUM'],
+    'run_live': 'true',
+    'apply_live': 'false',
+    'live_max_usd': os.environ['DEFAULT_MAX_USD'],
+    'live_max_input_tokens': os.environ['DEFAULT_MAX_IN'],
+    'live_max_output_tokens': os.environ['DEFAULT_MAX_OUT'],
+    'live_fail_on_cap': os.environ['DEFAULT_FAIL_ON_CAP'],
+  }
+}
+json.dump(payload,open('output/dispatch.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)
+print('Wrote output/dispatch.json')
+"
 
           api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
+          echo "Dispatching: ${api}"
           code="$(curl -sS -o output/dispatch_response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
-            --data-binary "@${p}" \
+            --data-binary "@output/dispatch.json" \
             "${api}")"
 
+          echo "http_code=${code}"
           if [ "${code}" != "204" ]; then
-            echo "ERROR: dispatch failed (http ${code})" >&2
+            echo "ERROR: dispatch failed (expected 204). Response body:" >&2
             cat output/dispatch_response.txt >&2 || true
             exit 7
           fi
 
+          echo "OK: dispatched AI Debug"
           echo "dispatched=true" >> "$GITHUB_OUTPUT"
 
-      - name: "Comment back (dispatch)"
-        if: ${{ steps.decide.outputs.action == 'dispatch' && steps.dispatch_ai.outputs.dispatched == 'true' }}
+      - name: "Comment back (when dispatched)"
+        if: ${{ steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -136,7 +198,7 @@ jobs:
             "${api}"
 
       - name: "Remove label (one-shot arm)"
-        if: ${{ github.event_name == 'issues' && steps.decide.outputs.action == 'dispatch' && steps.dispatch_ai.outputs.dispatched == 'true' }}
+        if: ${{ github.event_name == 'issues' && steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -146,39 +208,13 @@ jobs:
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/labels/${TRIGGER_LABEL}"
+          echo "Removing label via: ${api}"
           code="$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "${api}")"
-          if [ "${code}" != "200" ] && [ "${code}" != "204" ]; then
+          if [ "${code}" != "200" && [ "${code}" != "204" ]; then
             echo "WARN: failed to remove label (http ${code})" >&2
-          fi
-
-      - name: "/ai status (comment)"
-        if: ${{ steps.decide.outputs.action == 'status' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.repository.name }}
-          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
-        run: |
-          set -euo pipefail
-          # Find latest AI Debug run on main
-          api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/runs?branch=main&per_page=1"
-          run_id="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${api}" | jq -r '.workflow_runs[0].id // empty')"
-
-          if [ -z "${run_id}" ]; then
-            msg="No recent AI Debug runs found on main."
           else
-            run_url="https://github.com/${OWNER}/${REPO}/actions/runs/${run_id}"
-            msg="Latest AI Debug run: ${run_id}\n${run_url}\nNext: apply-live.yml by run_id (after live-dev exists)."
+            echo "OK: label removed"
           fi
-
-          api2="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/comments"
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            --data-binary "{\"body\":\"${msg}\"}" \
-            "${api2}"
