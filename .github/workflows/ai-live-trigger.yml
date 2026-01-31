@@ -23,45 +23,19 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
 
-    # Anti-duplication: one in-flight per issue
     concurrency:
       group: ai-live-${{ github.repository }}-${{ github.event.issue.number }}
       cancel-in-progress: true
 
     steps:
-      - name: "Parse event payload (safe)"
+      - name: "Extract event fields (safe, no multiline python)"
         id: ev
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c "import json,os,sys
-p=os.environ['GITHUB_EVENT_PATH']
-e=json.load(open(p,'r',encoding='utf-8'))
-def g(*path, default=''):
-  cur=e
-  for k in path:
-    if isinstance(cur,dict) and k in cur: cur=cur[k]
-    else: return default
-  return cur
-issue_num=str(g('issue','number',default='')).strip()
-label_name=str(g('label','name',default='')).strip()
-comment_body=str(g('comment','body',default='')).replace('\r','').replace('\n',' ').strip()
-author_assoc=str(g('comment','author_association',default='')).strip()
-event_name=os.environ.get('GITHUB_EVENT_NAME','').strip()
-out=os.environ['GITHUB_OUTPUT']
-with open(out,'a',encoding='utf-8') as f:
-  f.write(f'event_name={event_name}\n')
-  f.write(f'issue_num={issue_num}\n')
-  f.write(f'label_name={label_name}\n')
-  f.write(f'comment_body={comment_body}\n')
-  f.write(f'author_assoc={author_assoc}\n')
-print('event_name=',event_name)
-print('issue_num=',issue_num)
-print('label_name=',label_name)
-print('author_assoc=',author_assoc)
-"
+          python3 -c "import json,os; e=json.load(open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8')); g=lambda *p,default='': (lambda c: c if isinstance(c,str) else default)( (lambda cur: ( [ (cur:=cur.get(k) if isinstance(cur,dict) else None) for k in p ] and cur ) )(e) ) if (lambda cur: all(isinstance(cur,dict) and (k in cur) and not (cur:=cur[k]) is None for k in p[:-1]) and isinstance(cur,dict) and p[-1] in cur)(e) else default ); event=os.environ.get('GITHUB_EVENT_NAME',''); issue=str(e.get('issue',{}).get('number','')).strip(); label=str(e.get('label',{}).get('name','')).strip(); body=str(e.get('comment',{}).get('body','')).replace('\\r','').replace('\\n',' ').strip(); assoc=str(e.get('comment',{}).get('author_association','')).strip(); out=os.environ['GITHUB_OUTPUT']; open(out,'a',encoding='utf-8').write(f'event_name={event}\\nissue_num={issue}\\nlabel_name={label}\\ncomment_body={body}\\nauthor_assoc={assoc}\\n'); print('event_name=',event); print('issue_num=',issue); print('label_name=',label); print('author_assoc=',assoc)"
 
-      - name: "Decide if we should dispatch"
+      - name: "Decide"
         id: decide
         shell: bash
         env:
@@ -77,7 +51,6 @@ print('author_assoc=',author_assoc)
           reason=""
 
           if [ -z "${ISSUE_NUM}" ]; then
-            echo "No issue number in payload; abort."
             echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
             echo "issue_num=" >> "$GITHUB_OUTPUT"
             echo "reason=no_issue" >> "$GITHUB_OUTPUT"
@@ -122,10 +95,7 @@ print('author_assoc=',author_assoc)
           echo "should_dispatch=${should}" >> "$GITHUB_OUTPUT"
           echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
-
-          echo "should_dispatch=${should}"
-          echo "issue_num=${ISSUE_NUM}"
-          echo "reason=${reason}"
+          echo "should_dispatch=${should} reason=${reason} issue_num=${ISSUE_NUM}"
 
       - name: "Dispatch AI Debug (run_live=true, apply_live=false)"
         id: dispatch_ai
@@ -140,25 +110,9 @@ print('author_assoc=',author_assoc)
           set -euo pipefail
 
           mkdir -p output
-          python3 -c "import json,os
-payload={
-  'ref': os.environ['REF'],
-  'inputs':{
-    'issue': os.environ['ISSUE_NUM'],
-    'run_live': 'true',
-    'apply_live': 'false',
-    'live_max_usd': os.environ['DEFAULT_MAX_USD'],
-    'live_max_input_tokens': os.environ['DEFAULT_MAX_IN'],
-    'live_max_output_tokens': os.environ['DEFAULT_MAX_OUT'],
-    'live_fail_on_cap': os.environ['DEFAULT_FAIL_ON_CAP'],
-  }
-}
-json.dump(payload,open('output/dispatch.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)
-print('Wrote output/dispatch.json')
-"
+          python3 -c "import json,os; payload={'ref':os.environ['REF'],'inputs':{'issue':os.environ['ISSUE_NUM'],'run_live':'true','apply_live':'false','live_max_usd':os.environ['DEFAULT_MAX_USD'],'live_max_input_tokens':os.environ['DEFAULT_MAX_IN'],'live_max_output_tokens':os.environ['DEFAULT_MAX_OUT'],'live_fail_on_cap':os.environ['DEFAULT_FAIL_ON_CAP']}}; json.dump(payload,open('output/dispatch.json','w',encoding='utf-8'),ensure_ascii=True,indent=2); print('Wrote output/dispatch.json')"
 
           api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
-          echo "Dispatching: ${api}"
           code="$(curl -sS -o output/dispatch_response.txt -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -166,17 +120,15 @@ print('Wrote output/dispatch.json')
             --data-binary "@output/dispatch.json" \
             "${api}")"
 
-          echo "http_code=${code}"
           if [ "${code}" != "204" ]; then
-            echo "ERROR: dispatch failed (expected 204). Response body:" >&2
+            echo "ERROR: dispatch failed (expected 204). http_code=${code}" >&2
             cat output/dispatch_response.txt >&2 || true
             exit 7
           fi
 
-          echo "OK: dispatched AI Debug"
           echo "dispatched=true" >> "$GITHUB_OUTPUT"
 
-      - name: "Comment back (when dispatched)"
+      - name: "Comment back"
         if: ${{ steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
         shell: bash
         env:
@@ -208,13 +160,10 @@ print('Wrote output/dispatch.json')
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/labels/${TRIGGER_LABEL}"
-          echo "Removing label via: ${api}"
           code="$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "${api}")"
           if [ "${code}" != "200" && [ "${code}" != "204" ]; then
             echo "WARN: failed to remove label (http ${code})" >&2
-          else
-            echo "OK: label removed"
           fi
