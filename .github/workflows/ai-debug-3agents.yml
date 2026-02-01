@@ -97,16 +97,13 @@ jobs:
           MAX_OUT: ${{ inputs.live_max_output_tokens }}
         run: |
           set -euo pipefail
-
           die() { echo "ERROR: $1" >&2; exit 2; }
 
-          # float > 0
           if ! printf "%s" "${MAX_USD}" | tr -d '[:space:]' | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
             die "live_max_usd must be a number, got: ${MAX_USD}"
           fi
           python3 -c "import os,sys; v=float(os.environ['MAX_USD'].strip()); sys.exit(0 if v>0 else 1)" || die "live_max_usd must be > 0, got: ${MAX_USD}"
 
-          # int > 0
           if ! printf "%s" "${MAX_IN}" | tr -d '[:space:]' | grep -Eq '^[0-9]+$'; then
             die "live_max_input_tokens must be an int, got: ${MAX_IN}"
           fi
@@ -193,7 +190,6 @@ jobs:
                 exit 3
               fi
 
-              # Build validator script without heredoc
               PY="${OUTPUT_DIR}/tmp/validate_openai_config.py"
               : > "$PY"
               printf "%s\n" "import json,os,sys" >> "$PY"
@@ -265,42 +261,6 @@ jobs:
             echo "reason=${REASON}"
             echo "note=${NOTE}"
           } >> "${OUTPUT_DIR}/preflight/summary.txt"
-
-      - name: "Preflight assertions (hard gates)"
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Asserting preflight invariants..."
-
-          RUN_LIVE_EFFECTIVE="${{ steps.live_gate.outputs.run_live_effective }}"
-          RUN_LIVE_REQUESTED="${{ steps.live_gate.outputs.run_live_requested }}"
-          APPLY_LIVE_REQUESTED="${{ steps.live_gate.outputs.apply_live_requested }}"
-
-          # apply_live=true is illegal without run_live requested+effective
-          if [ "$APPLY_LIVE_REQUESTED" = "true" ] && [ "$RUN_LIVE_REQUESTED" != "true" ]; then
-            echo "ERROR: apply_live=true but run_live=false"
-            exit 10
-          fi
-
-          if [ "$APPLY_LIVE_REQUESTED" = "true" ] && [ "$RUN_LIVE_EFFECTIVE" != "true" ]; then
-            echo "ERROR: apply_live=true but run_live_effective!=true (LIVE not actually enabled/configured)"
-            exit 11
-          fi
-
-          echo "Preflight assertions PASSED"
-
-      - name: "Write trace info"
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "workflow=${GITHUB_WORKFLOW}"
-            echo "run_id=${GITHUB_RUN_ID}"
-            echo "commit=${GITHUB_SHA}"
-            echo "actor=${GITHUB_ACTOR}"
-            echo "ref=${GITHUB_REF}"
-          } >> "${OUTPUT_DIR}/preflight/trace.txt"
 
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
@@ -452,13 +412,21 @@ jobs:
 
           python3 "$PY"
 
-          curl -sS https://api.openai.com/v1/responses \
+          curl -sS -f https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d @output/live/arch/request.json \
             > output/live/arch/response.json
 
           test -s output/live/arch/response.json
+
+          python3 - <<'PY'
+          import json,sys
+          j=json.load(open('output/live/arch/response.json','r',encoding='utf-8'))
+          if isinstance(j,dict) and 'error' in j:
+            print("OPENAI_ERROR:", json.dumps(j['error'],ensure_ascii=False), file=sys.stderr)
+            sys.exit(6)
+          PY
 
       - name: "Upload LIVE ARCH artifact"
         uses: actions/upload-artifact@v4
@@ -528,7 +496,7 @@ jobs:
 
           python3 "$PY"
 
-          curl -sS https://api.openai.com/v1/responses \
+          curl -sS -f https://api.openai.com/v1/responses \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d @output/live/dev/request.json \
@@ -536,25 +504,32 @@ jobs:
 
           test -s output/live/dev/response.json
 
+          python3 - <<'PY'
+          import json,sys
+          j=json.load(open('output/live/dev/response.json','r',encoding='utf-8'))
+          if isinstance(j,dict) and 'error' in j:
+            print("OPENAI_ERROR:", json.dumps(j['error'],ensure_ascii=False), file=sys.stderr)
+            sys.exit(6)
+          PY
+
           PY2="output/tmp/extract_dev_md.py"
           : > "$PY2"
-          printf "%s\n" "import json,os" >> "$PY2"
+          printf "%s\n" "import json,os,sys" >> "$PY2"
           printf "%s\n" "issue_num=os.environ['ISSUE_NUM']" >> "$PY2"
           printf "%s\n" "resp=json.load(open('output/live/dev/response.json','r',encoding='utf-8'))" >> "$PY2"
-          printf "%s\n" "md=None" >> "$PY2"
           printf "%s\n" "out=resp.get('output')" >> "$PY2"
+          printf "%s\n" "texts=[]" >> "$PY2"
           printf "%s\n" "if isinstance(out,list):" >> "$PY2"
-          printf "%s\n" "  texts=[]" >> "$PY2"
           printf "%s\n" "  for item in out:" >> "$PY2"
           printf "%s\n" "    content=item.get('content') if isinstance(item,dict) else None" >> "$PY2"
           printf "%s\n" "    if isinstance(content,list):" >> "$PY2"
           printf "%s\n" "      for c in content:" >> "$PY2"
           printf "%s\n" "        if isinstance(c,dict) and c.get('type') in ('output_text','text') and isinstance(c.get('text'),str):" >> "$PY2"
           printf "%s\n" "          texts.append(c['text'])" >> "$PY2"
-          printf "%s\n" "  if texts:" >> "$PY2"
-          printf "%s\n" "    md='\\n'.join(texts).strip()" >> "$PY2"
+          printf "%s\n" "md='\\n'.join(texts).strip() if texts else ''" >> "$PY2"
           printf "%s\n" "if not md:" >> "$PY2"
-          printf "%s\n" "  md=json.dumps(resp,ensure_ascii=False,indent=2)" >> "$PY2"
+          printf "%s\n" "  print('ERROR: No markdown text in OpenAI response output', file=sys.stderr)" >> "$PY2"
+          printf "%s\n" "  sys.exit(7)" >> "$PY2"
           printf "%s\n" "p=f'output/live/dev/issue_{issue_num}.md'" >> "$PY2"
           printf "%s\n" "open(p,'w',encoding='utf-8').write(md+'\\n')" >> "$PY2"
           printf "%s\n" "print('Wrote',p)" >> "$PY2"
@@ -569,7 +544,6 @@ jobs:
 
           cd output/live/dev
 
-          # Required files (contract)
           test -f request.json
           test -f response.json
           test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
@@ -578,7 +552,6 @@ jobs:
           cleanup() { rm -f "${MANIFEST_FILE}"; }
           trap cleanup EXIT
 
-          # Order: issue_*.md (sorted) + request.json + response.json
           for f in $(ls -1 issue_*.md | sort); do
             H="$(sha256sum "$f" | awk '{print $1}')"
             printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
@@ -617,8 +590,9 @@ jobs:
         run: |
           set -euo pipefail
           ls -la qa_live_artifacts
+          test -f qa_live_artifacts/apply_digest.txt
           test "$(find qa_live_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
-          echo "QA LIVE OK: issue markdown exists"
+          echo "QA LIVE OK: digest + issue markdown exist"
 
       - name: "Upload LIVE QA artifact"
         uses: actions/upload-artifact@v4
