@@ -4,110 +4,216 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug workflow run id that produced artifact 'live-dev' (e.g. 21536204217)"
+        description: "Source AI Debug run_id that produced artifact 'live-dev'"
         required: true
-        default: ""
+        type: string
       issue:
-        description: "Issue number (e.g. 1). Used for expected filename and branch naming."
+        description: "Issue number (e.g. 1). Used for filename and branch naming."
         required: true
-        default: "1"
+        type: string
       base_branch:
         description: "Base branch for PR (usually main)."
         required: true
         default: "main"
+        type: string
       dry_run:
         description: "If true: validate only, do not push branch or create PR."
         required: true
-        type: boolean
         default: true
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   actions: read
 
 env:
   ARTIFACT_NAME: "live-dev"
-  OUTPUT_DIR: "output"
-  BRANCH_PREFIX: "ai-live/issue-"
 
 jobs:
-  apply:
+  apply_live_dev:
     runs-on: ubuntu-latest
-    steps:
-      - name: "Checkout"
-        uses: actions/checkout@v4
 
-      - name: "Download LIVE DEV artifact from run_id"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Download LIVE DEV artifact from run_id
         uses: actions/download-artifact@v4
         with:
-          # IMPORTANT: download from a DIFFERENT workflow run
-          run-id: ${{ inputs.run_id }}
-          repository: ${{ github.repository }}
-          github-token: ${{ github.token }}
           name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.OUTPUT_DIR }}/live-dev
+          run-id: ${{ inputs.run_id }}
+          path: output/live-dev
 
-      - name: "Validate artifact contents"
+      - name: Validate artifact contents (fail-fast on error payloads)
         shell: bash
         run: |
           set -euo pipefail
-          ls -la "${OUTPUT_DIR}/live-dev"
-          test -f "${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" || {
-            echo "Missing expected file: ${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" >&2
-            echo "Files present:" >&2
-            find "${OUTPUT_DIR}/live-dev" -maxdepth 2 -type f -print >&2
+
+          if [ ! -d "output/live-dev" ]; then
+            echo "ERROR: output/live-dev folder missing after download."
             exit 2
-          }
-          echo "OK: expected issue markdown exists"
-
-      - name: "Materialize into repo (.ai/dev)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .ai/dev
-          cp -f "${OUTPUT_DIR}/live-dev/issue_${{ inputs.issue }}.md" ".ai/dev/issue_${{ inputs.issue }}.md"
-
-          # Optional traceability file if exists in artifact
-          if [ -f "${OUTPUT_DIR}/live-dev/response.json" ]; then
-            mkdir -p "${OUTPUT_DIR}"
-            sha256sum "${OUTPUT_DIR}/live-dev/response.json" | awk '{print $1}' > "${OUTPUT_DIR}/apply_digest.txt"
-          else
-            echo "no-response-json" > "${OUTPUT_DIR}/apply_digest.txt"
           fi
 
-      - name: "Stop if dry_run=true"
+          # Сигнал что артефакт реально не пустой
+          if ! find "output/live-dev" -type f -maxdepth 4 | head -n 1 | grep -q .; then
+            echo "ERROR: live-dev artifact downloaded but appears empty."
+            exit 3
+          fi
+
+          # Блокируем применение, если внутри есть JSON/MD с явной ошибкой quota/insufficient_quota
+          # (мы НЕ хотим чтобы такое попадало в PR)
+          if rg -n --hidden --no-ignore-vcs -S \
+            '(insufficient_quota|You exceeded your current quota|"error"\s*:)' \
+            "output/live-dev" >/dev/null 2>&1; then
+            echo "ERROR: live-dev artifact contains an error payload (quota/error). Refusing to apply."
+            echo "---- matches ----"
+            rg -n --hidden --no-ignore-vcs -S \
+              '(insufficient_quota|You exceeded your current quota|"error"\s*:)' \
+              "output/live-dev" || true
+            exit 10
+          fi
+
+      - name: Compute digest (traceability)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          # digest по содержимому артефакта (стабильно, без зависимости от zip)
+          # сортируем файлы и считаем sha256 от (sha256(file)+path)
+          tmp="output/_digest_input.txt"
+          : > "$tmp"
+          while IFS= read -r -d '' f; do
+            h="$(sha256sum "$f" | awk '{print $1}')"
+            p="${f#output/live-dev/}"
+            printf "%s  %s\n" "$h" "$p" >> "$tmp"
+          done < <(find output/live-dev -type f -print0 | sort -z)
+
+          DIGEST="$(sha256sum "$tmp" | awk '{print $1}')"
+          echo "$DIGEST" > output/apply_digest.txt
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Digest: $DIGEST"
+
+      - name: Prepare branch + apply allowlist
+        id: prep
+        shell: bash
+        env:
+          ISSUE: ${{ inputs.issue }}
+          RUN_ID: ${{ inputs.run_id }}
+          BASE: ${{ inputs.base_branch }}
+        run: |
+          set -euo pipefail
+
+          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
+          echo "branch=$BR" >> "$GITHUB_OUTPUT"
+          echo "Branch: $BR"
+
+          # ВАЖНО: применяем ТОЛЬКО то, что реально должно лечь в репо.
+          # Сейчас у нас артефакт маленький и часто содержит служебные штуки.
+          # Поэтому применяем по allowlist:
+          # - .ai/dev/**   (но НЕ issue_*.md из артефакта — мы генерим свой)
+          # - output/**    (если нужно; при желании можно убрать)
+          #
+          # 1) копируем .ai/dev (если есть)
+          if [ -d "output/live-dev/.ai/dev" ]; then
+            mkdir -p .ai/dev
+            rsync -a --delete \
+              --exclude 'issue_*.md' \
+              "output/live-dev/.ai/dev/" ".ai/dev/"
+          fi
+
+          # 2) копируем output (если есть)
+          if [ -d "output/live-dev/output" ]; then
+            mkdir -p output
+            rsync -a --delete "output/live-dev/output/" "output/"
+          fi
+
+          # 3) генерим нормальный apply-отчёт (вместо error-json)
+          mkdir -p .ai/dev
+          {
+            echo "# LIVE DEV apply record"
+            echo ""
+            echo "- issue: ${ISSUE}"
+            echo "- run_id: ${RUN_ID}"
+            echo "- base_branch: ${BASE}"
+            echo "- artifact: live-dev"
+            echo "- digest: $(cat output/apply_digest.txt)"
+            echo "- applied_at_utc: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "- note: generated by apply-live.yml (error payloads are blocked)."
+          } > ".ai/dev/issue_${ISSUE}.md"
+
+      - name: No-op if dry_run=true
         if: ${{ inputs.dry_run == true }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DRY RUN: validated and staged files, but will not push/PR."
-          echo "Staged file: .ai/dev/issue_${{ inputs.issue }}.md"
-          exit 0
+          echo "dry_run=true → validated + staged changes locally, will not push/PR."
+          git status --porcelain || true
 
-      - name: "Commit to branch"
+      - name: Create branch, commit, push
+        if: ${{ inputs.dry_run == false }}
         shell: bash
+        env:
+          BRANCH: ${{ steps.prep.outputs.branch }}
         run: |
           set -euo pipefail
-          BR="${BRANCH_PREFIX}${{ inputs.issue }}-run-${{ inputs.run_id }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git checkout -B "$BR"
-          git add .ai/dev "${OUTPUT_DIR}/apply_digest.txt" || true
-          git commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}" || true
-          git push -u origin "$BR" --force
+          git checkout -b "$BRANCH"
 
-      - name: "Create/Update PR"
+          # Коммитим только ожидаемые пути (чтобы мусор не попадал)
+          git add -A .ai/dev output/apply_digest.txt output || true
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}"
+
+          git push -u origin "$BRANCH"
+
+      - name: Create PR
+        if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.prep.outputs.branch }}
+          BASE: ${{ inputs.base_branch }}
+          ISSUE: ${{ inputs.issue }}
+          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          BR="${BRANCH_PREFIX}${{ inputs.issue }}-run-${{ inputs.run_id }}"
-          BASE="${{ inputs.base_branch }}"
-          TITLE="ai-live: issue #${{ inputs.issue }} (run ${{ inputs.run_id }})"
-          BODY="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from workflow run ${{ inputs.run_id }}. Includes digest for traceability."
 
-          gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
-          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
+          title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
+          body="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from workflow run ${RUN_ID}.\n\n- digest: $(cat output/apply_digest.txt)\n- note: error payloads are blocked; apply record is generated in .ai/dev/issue_${ISSUE}.md\n"
+
+          # создаём PR через API (без gh CLI)
+          api="https://api.github.com/repos/${{ github.repository }}/pulls"
+          data="$(python3 - <<'PY'
+import json, os
+print(json.dumps({
+  "title": os.environ["title"] if "title" in os.environ else "",
+  "head": os.environ["BRANCH"],
+  "base": os.environ["BASE"],
+  "body": os.environ["body"] if "body" in os.environ else ""
+}))
+PY
+)"
+          # прокидываем title/body через env безопасно
+          export title="$title"
+          export body="$body"
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "$data" \
+            "$api" > output/pr_response.json
+
+          echo "PR response:"
+          cat output/pr_response.json
