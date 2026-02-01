@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug workflow run_id that contains artifact 'live-dev'"
+        description: "AI Debug run_id that contains artifact 'live-dev'"
         required: true
         type: string
       issue:
@@ -12,14 +12,14 @@ on:
         required: true
         type: string
       base_branch:
-        description: "Base branch to apply onto (usually main)"
-        required: true
+        description: "Base branch (usually main)"
+        required: false
         default: "main"
         type: string
       dry_run:
-        description: "If true: validate/prepare only, no commit/push/PR"
-        required: true
-        default: "true"
+        description: "If true: validate only, do not commit/PR"
+        required: false
+        default: true
         type: boolean
 
 permissions:
@@ -28,219 +28,152 @@ permissions:
   issues: write
   actions: read
 
-env:
-  ARTIFACT_NAME: "live-dev"
-  ARTIFACT_DIR: "_live_dev_artifact"
-
 jobs:
   apply_live_dev:
     runs-on: ubuntu-latest
-
-    concurrency:
-      group: apply-live-dev-${{ github.repository }}-${{ inputs.issue }}
-      cancel-in-progress: true
+    environment: live-apply
 
     steps:
-      - name: "Set up job"
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "run_id=${{ inputs.run_id }}"
-          echo "issue=${{ inputs.issue }}"
-          echo "base_branch=${{ inputs.base_branch }}"
-          echo "dry_run=${{ inputs.dry_run }}"
-
       - name: "Checkout base branch"
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.base_branch }}
-          fetch-depth: 0
 
       - name: "Download LIVE DEV artifact from run_id"
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_DIR }}
+          name: live-dev
+          github-token: ${{ github.token }}
           run-id: ${{ inputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: _live_dev_artifact
 
       - name: "Validate + normalize artifact contents"
-        id: normalize
         shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
           echo "Listing artifact dir:"
-          ls -la "${ARTIFACT_DIR}" || true
+          ls -la _live_dev_artifact || true
           echo "Tree:"
-          (cd "${ARTIFACT_DIR}" && find . -maxdepth 4 -type f -print | sort) || true
+          find _live_dev_artifact -maxdepth 3 -type f -print || true
 
-          # Support BOTH layouts:
-          # A) root files in artifact:
-          #    issue_1.md, request.json, response.json
-          # B) repo-like layout inside artifact:
-          #    .ai/dev/issue_1.md, .ai/dev/request.json, .ai/dev/response.json
+          # Must contain these files (as produced by ai-debug-3agents.yml)
+          test -f "_live_dev_artifact/issue_${{ inputs.issue }}.md" \
+            || { echo "ERROR: missing _live_dev_artifact/issue_${{ inputs.issue }}.md" >&2; exit 11; }
+          test -f "_live_dev_artifact/request.json" \
+            || { echo "ERROR: missing _live_dev_artifact/request.json" >&2; exit 11; }
+          test -f "_live_dev_artifact/response.json" \
+            || { echo "ERROR: missing _live_dev_artifact/response.json" >&2; exit 11; }
 
-          ROOT_ISSUE="${ARTIFACT_DIR}/issue_${ISSUE}.md"
-          ROOT_REQ="${ARTIFACT_DIR}/request.json"
-          ROOT_RESP="${ARTIFACT_DIR}/response.json"
+          # Make sure output dir exists in repo worktree
+          mkdir -p output .ai/dev
 
-          NESTED_ISSUE="${ARTIFACT_DIR}/.ai/dev/issue_${ISSUE}.md"
-          NESTED_REQ="${ARTIFACT_DIR}/.ai/dev/request.json"
-          NESTED_RESP="${ARTIFACT_DIR}/.ai/dev/response.json"
-
-          pick_path() {
-            local a="$1"
-            local b="$2"
-            if [ -f "$a" ]; then
-              printf "%s" "$a"
-              return 0
-            fi
-            if [ -f "$b" ]; then
-              printf "%s" "$b"
-              return 0
-            fi
-            return 1
-          }
-
-          ISSUE_SRC="$(pick_path "$ROOT_ISSUE" "$NESTED_ISSUE" || true)"
-          REQ_SRC="$(pick_path "$ROOT_REQ" "$NESTED_REQ" || true)"
-          RESP_SRC="$(pick_path "$ROOT_RESP" "$NESTED_RESP" || true)"
-
-          if [ -z "${ISSUE_SRC}" ] || [ -z "${REQ_SRC}" ] || [ -z "${RESP_SRC}" ]; then
-            echo "ERROR: artifact missing required files." >&2
-            echo "Expected either:" >&2
-            echo "  ${ROOT_ISSUE} + ${ROOT_REQ} + ${ROOT_RESP}" >&2
-            echo "or:" >&2
-            echo "  ${NESTED_ISSUE} + ${NESTED_REQ} + ${NESTED_RESP}" >&2
-            exit 11
-          fi
-
-          mkdir -p _normalized
-          cp -f "${ISSUE_SRC}" "_normalized/issue_${ISSUE}.md"
-          cp -f "${REQ_SRC}" "_normalized/request.json"
-          cp -f "${RESP_SRC}" "_normalized/response.json"
-
-          echo "Normalized files:"
-          ls -la _normalized
-
-          # Compute digest for traceability
-          python3 - << 'PY'
-          import hashlib, pathlib
-          p = pathlib.Path("_normalized")
-          files = ["request.json", "response.json"] + sorted([x.name for x in p.glob("issue_*.md")])
-          h = hashlib.sha256()
-          for name in files:
-            data = (p / name).read_bytes()
-            h.update(name.encode("utf-8") + b"\0" + data + b"\0")
-          digest = h.hexdigest()
-          pathlib.Path("output").mkdir(exist_ok=True)
-          pathlib.Path("output/apply_digest.txt").write_text(digest + "\n", encoding="utf-8")
-          print("apply_digest:", digest)
-          PY
-
-          echo "issue_path=_normalized/issue_${ISSUE}.md" >> "$GITHUB_OUTPUT"
-          echo "request_path=_normalized/request.json" >> "$GITHUB_OUTPUT"
-          echo "response_path=_normalized/response.json" >> "$GITHUB_OUTPUT"
-          echo "digest_path=output/apply_digest.txt" >> "$GITHUB_OUTPUT"
+          # Compute a stable digest for traceability (based on artifact content)
+          digest="$( (cd _live_dev_artifact && find . -type f -print0 | sort -z | xargs -0 sha256sum) | sha256sum | awk '{print $1}' )"
+          echo "apply_digest=${digest}" | tee output/apply_digest.txt
 
       - name: "Stop after validation (dry_run=true)"
         if: ${{ inputs.dry_run == true }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "dry_run=true => stopping here (no apply)."
-          echo "Digest:"
-          cat output/apply_digest.txt
+          echo "dry_run=true -> validation complete, stopping."
 
       - name: "Apply artifact into repo working tree"
         if: ${{ inputs.dry_run == false }}
         shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-          ISSUE_MD: ${{ steps.normalize.outputs.issue_path }}
-          REQ_JSON: ${{ steps.normalize.outputs.request_path }}
-          RESP_JSON: ${{ steps.normalize.outputs.response_path }}
-          DIGEST_TXT: ${{ steps.normalize.outputs.digest_path }}
         run: |
           set -euo pipefail
-          mkdir -p .ai/dev output
-          cp -f "${ISSUE_MD}" ".ai/dev/issue_${ISSUE}.md"
-          cp -f "${REQ_JSON}" "output/request.json"
-          cp -f "${RESP_JSON}" "output/response.json"
-          cp -f "${DIGEST_TXT}" "output/apply_digest.txt"
 
-          echo "Applied files:"
-          git status --porcelain
-          ls -la .ai/dev || true
-          ls -la output || true
+          # Apply everything from artifact root to repo root (overwrites as needed).
+          # This avoids 'cp same file' and keeps paths stable.
+          rsync -a --checksum \
+            --exclude ".git/" \
+            _live_dev_artifact/ ./
+
+          # Ensure digest file remains in output/ (rsync may have overwritten it)
+          test -f output/apply_digest.txt
 
       - name: "Create branch + commit + push"
         if: ${{ inputs.dry_run == false }}
-        id: push
         shell: bash
         env:
-          ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
-          BASE_BRANCH: ${{ inputs.base_branch }}
+          ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
           BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          git switch -c "${BR}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add .ai/dev "output/request.json" "output/response.json" "output/apply_digest.txt"
+          git checkout -b "${BR}"
+
+          git add -A
           if git diff --cached --quiet; then
-            echo "No changes staged; nothing to commit."
-            echo "branch=${BR}" >> "$GITHUB_OUTPUT"
-            echo "pushed=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "ERROR: no changes after apply; nothing to commit." >&2
+            exit 12
           fi
 
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}"
-
-          git push -u origin "${BR}"
+          git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}"
+          git push --force-with-lease origin "${BR}"
 
           echo "branch=${BR}" >> "$GITHUB_OUTPUT"
-          echo "pushed=true" >> "$GITHUB_OUTPUT"
 
       - name: "Open PR"
-        if: ${{ inputs.dry_run == false && steps.push.outputs.pushed == 'true' }}
-        id: pr
+        if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE: ${{ inputs.issue }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
           RUN_ID: ${{ inputs.run_id }}
-          BASE_BRANCH: ${{ inputs.base_branch }}
-          BRANCH: ${{ steps.push.outputs.branch }}
+          ISSUE: ${{ inputs.issue }}
+          BASE: ${{ inputs.base_branch }}
         run: |
           set -euo pipefail
 
-          # Create PR via GitHub API (no gh dependency)
+          head="ai-live/issue-${ISSUE}-run-${RUN_ID}"
           title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="Apply LIVE DEV artifact \`${ARTIFACT_NAME}\` from workflow run ${RUN_ID}.\n\nIncludes digest in \`output/apply_digest.txt\` for traceability."
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls"
+          body="Apply LIVE DEV artifact 'live-dev' from workflow run ${RUN_ID}. Includes digest in output/apply_digest.txt for traceability."
 
+          api="https://api.github.com/repos/${OWNER}/${REPO}/pulls"
+          payload="$(python3 - <<'PY'
+import json, os
+print(json.dumps({
+  "title": os.environ["title"] if "title" in os.environ else "",
+  "head": os.environ["head"] if "head" in os.environ else "",
+  "base": os.environ["BASE"],
+  "body": os.environ["body"] if "body" in os.environ else ""
+}))
+PY
+)"
+          # inject vars safely (no jq dependency)
           payload="$(python3 - <<PY
-          import json, os
-          print(json.dumps({
-            "title": os.environ["title"] if "title" in os.environ else "",
-            "head": os.environ["BRANCH"],
-            "base": os.environ["BASE_BRANCH"],
-            "body": os.environ["body"] if "body" in os.environ else ""
-          }))
-          PY
-          )"
+import json, os
+p = {
+  "title": os.environ["TITLE"],
+  "head": os.environ["HEAD"],
+  "base": os.environ["BASE"],
+  "body": os.environ["BODY"],
+}
+print(json.dumps(p))
+PY
+)" || true
 
-          # Export for python above
-          export title body
+          # Simpler: build payload directly
+          payload="$(python3 - <<PY
+import json, os
+print(json.dumps({
+  "title": f"ai-live: issue #{os.environ['ISSUE']} (run {os.environ['RUN_ID']})",
+  "head": f"ai-live/issue-{os.environ['ISSUE']}-run-{os.environ['RUN_ID']}",
+  "base": os.environ["BASE"],
+  "body": f"Apply LIVE DEV artifact 'live-dev' from workflow run {os.environ['RUN_ID']}. Includes digest in output/apply_digest.txt for traceability."
+}))
+PY
+)"
 
-          resp="output/pr_response.json"
-          code="$(curl -sS -o "${resp}" -w "%{http_code}" -X POST \
+          code="$(curl -sS -o pr.json -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
@@ -248,39 +181,10 @@ jobs:
             "${api}")"
 
           if [ "${code}" != "201" ]; then
-            echo "ERROR: PR create failed. http_code=${code}" >&2
-            cat "${resp}" >&2 || true
-            exit 20
+            echo "ERROR: failed to open PR (expected 201). http_code=${code}" >&2
+            cat pr.json >&2 || true
+            exit 13
           fi
 
-          pr_url="$(python3 -c "import json; print(json.load(open('${resp}','r',encoding='utf-8')).get('html_url',''))")"
-          pr_num="$(python3 -c "import json; print(json.load(open('${resp}','r',encoding='utf-8')).get('number',''))")"
-
-          if [ -z "${pr_url}" ] || [ -z "${pr_num}" ]; then
-            echo "ERROR: PR created but response missing url/number" >&2
-            cat "${resp}" >&2 || true
-            exit 21
-          fi
-
-          echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
-          echo "pr_number=${pr_num}" >> "$GITHUB_OUTPUT"
-          echo "Opened PR: ${pr_url}"
-
-      - name: "Comment back to issue with PR link"
-        if: ${{ inputs.dry_run == false && steps.pr.outputs.pr_url != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE: ${{ inputs.issue }}
-          PR_URL: ${{ steps.pr.outputs.pr_url }}
-          RUN_ID: ${{ inputs.run_id }}
-        run: |
-          set -euo pipefail
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${ISSUE}/comments"
-          msg="Applied LIVE DEV from run ${RUN_ID} → PR: ${PR_URL}"
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            --data-binary "{\"body\":\"${msg}\"}" \
-            "${api}" > /dev/null
+          pr_url="$(python3 -c "import json; print(json.load(open('pr.json'))['html_url'])")"
+          echo "PR: ${pr_url}"
