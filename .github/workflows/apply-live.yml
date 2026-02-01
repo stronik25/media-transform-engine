@@ -1,0 +1,67 @@
+name: "Apply LIVE DEV (by run_id)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "AI Debug run_id that contains artifact live-dev"
+        required: true
+        type: string
+      issue:
+        description: "Issue number (e.g. 1)"
+        required: true
+        type: string
+      base_branch:
+        description: "Base branch to apply onto (usually main)"
+        required: false
+        default: "main"
+        type: string
+      artifact_name:
+        description: "Artifact name to download (default: live-dev)"
+        required: false
+        default: "live-dev"
+        type: string
+      dry_run:
+        description: "true = validate only; false = create branch + PR"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  apply_live_dev:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Download LIVE DEV artifact from run_id
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.run_id }}
+          path: _live_dev_artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate / apply (python)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run_id }}
+          ISSUE: ${{ inputs.issue }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ARTIFACT_DIR: "_live_dev_artifact"
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/apply_live_dev.py
