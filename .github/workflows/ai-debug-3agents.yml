@@ -525,6 +525,40 @@ jobs:
 
           python3 "$PY2"
 
+      - name: "Write apply_digest.txt (contract v1)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          cd output/live/dev
+
+          # Required files (contract)
+          test -f request.json
+          test -f response.json
+          test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
+
+          MANIFEST_FILE="$(mktemp)"
+          cleanup() { rm -f "${MANIFEST_FILE}"; }
+          trap cleanup EXIT
+
+          # Order: issue_*.md (sorted) + request.json + response.json
+          for f in $(ls -1 issue_*.md | sort); do
+            H="$(sha256sum "$f" | awk '{print $1}')"
+            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
+          done
+
+          for f in request.json response.json; do
+            H="$(sha256sum "$f" | awk '{print $1}')"
+            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
+          done
+
+          FINAL="$(sha256sum "${MANIFEST_FILE}" | awk '{print $1}')"
+          printf "sha256:%s\n" "${FINAL}" > apply_digest.txt
+
+          test -s apply_digest.txt
+          echo "OK: wrote apply_digest.txt sha256:${FINAL}"
+
       - name: "Upload LIVE DEV artifact"
         uses: actions/upload-artifact@v4
         with:
