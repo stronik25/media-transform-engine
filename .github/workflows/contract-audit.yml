@@ -8,6 +8,12 @@ on:
         required: true
         type: string
 
+  workflow_run:
+    workflows:
+      - "AI Debug (v5 gates; v4 deterministic default)"
+    types:
+      - completed
+
 permissions:
   actions: read
   contents: read
@@ -15,16 +21,32 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    if: >
+      ${{
+        (github.event_name == 'workflow_dispatch') ||
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+      }}
     steps:
       - name: Checkout (for optional digest script)
         uses: actions/checkout@v4
 
-      - name: Download live-dev artifact by run_id
+      - name: Resolve run id
+        id: rid
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_id=${{ inputs.run_id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download live-dev artifact by run_id (fail-fast if missing)
         uses: actions/download-artifact@v4
         with:
           name: live-dev
           path: audit/live-dev
-          run-id: ${{ inputs.run_id }}
+          run-id: ${{ steps.rid.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify live-dev contract (structure strict; digest best-effort)
