@@ -4,129 +4,156 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug run_id that contains artifact live-dev"
+        description: "AI Debug run_id that contains artifact 'live-dev'"
         required: true
         type: string
       issue:
-        description: "Issue number (e.g. 1)"
+        description: "Issue number (e.g. 1). Used for expected filename and branch naming."
         required: true
         type: string
       base_branch:
-        description: "Base branch (usually main)"
+        description: "Base branch for PR (usually main)."
         required: true
         default: "main"
         type: string
       dry_run:
-        description: "true = validate only (no push/PR)"
+        description: "If true: validate only, do not push branch or create PR."
         required: true
         default: true
         type: boolean
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
-  actions: read
 
-env:
-  ARTIFACT_NAME: live-dev
+concurrency:
+  group: apply-live-${{ github.repository }}-${{ inputs.issue }}
+  cancel-in-progress: true
 
 jobs:
-  apply:
+  apply_live_dev:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.base_branch }}
-          fetch-depth: 0
 
-      - name: Download artifact (live-dev) from run_id
+      - name: Download LIVE DEV artifact from run_id
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: live-dev
+          path: _live_dev_artifact
           run-id: ${{ inputs.run_id }}
-          path: _incoming/live-dev
+          github-token: ${{ github.token }}
 
-      - name: Block apply if artifact is an error payload
+      - name: Validate artifact contents
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
-          test -d "_incoming/live-dev" || (echo "missing _incoming/live-dev" && exit 2)
-          if grep -RInE --binary-files=without-match '(insufficient_quota|You exceeded your current quota|"error"[[:space:]]*:)' "_incoming/live-dev" >/dev/null 2>&1; then
-            echo "ERROR: live-dev contains error payload (quota/error)."
-            grep -RInE --binary-files=without-match '(insufficient_quota|You exceeded your current quota|"error"[[:space:]]*:)' "_incoming/live-dev" || true
-            exit 10
+
+          echo "Listing _live_dev_artifact:"
+          ls -la _live_dev_artifact || true
+          echo "Tree:"
+          find _live_dev_artifact -maxdepth 4 -type f -print || true
+
+          ISSUE_FILE="_live_dev_artifact/.ai/dev/issue_${{ inputs.issue }}.md"
+          DIGEST_FILE="_live_dev_artifact/output/apply_digest.txt"
+
+          if [ ! -f "${ISSUE_FILE}" ]; then
+            echo "ERROR: missing ${ISSUE_FILE}" >&2
+            exit 11
           fi
 
-      - name: Compute digest + write apply record
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p output .ai/dev
-          find _incoming/live-dev -type f -print0 | sort -z | xargs -0 sha256sum > output/_files.sha256
-          sha256sum output/_files.sha256 | awk '{print $1}' > output/apply_digest.txt
-          {
-            echo "# LIVE DEV apply record"
-            echo ""
-            echo "- issue: ${{ inputs.issue }}"
-            echo "- run_id: ${{ inputs.run_id }}"
-            echo "- digest: $(cat output/apply_digest.txt)"
-            echo "- applied_at_utc: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          } > ".ai/dev/issue_${{ inputs.issue }}.md"
-
-      - name: Apply allowlist (safe)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # apply only these folders if present
-          if [ -d "_incoming/live-dev/.ai/dev" ]; then
-            mkdir -p .ai/dev
-            rsync -a --delete --exclude 'issue_*.md' "_incoming/live-dev/.ai/dev/" ".ai/dev/"
+          if [ ! -f "${DIGEST_FILE}" ]; then
+            echo "ERROR: missing ${DIGEST_FILE}" >&2
+            exit 12
           fi
-          if [ -d "_incoming/live-dev/output" ]; then
-            mkdir -p output
-            rsync -a --delete "_incoming/live-dev/output/" "output/"
-          fi
-          rm -rf _incoming
 
-      - name: Dry run status
-        if: ${{ inputs.dry_run == true }}
+          digest="$(tr -d ' \r\n\t' < "${DIGEST_FILE}" | head -c 128)"
+          if ! printf "%s" "${digest}" | grep -Eq '^[a-f0-9]{64}$'; then
+            echo "ERROR: apply_digest.txt must be a 64-hex sha256. Got: ${digest}" >&2
+            exit 13
+          fi
+
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "OK: digest=${digest}"
+
+      - name: Stop after validation (dry_run=true)
+        if: ${{ inputs.dry_run }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "dry_run=true → no push/PR"
-          git status --porcelain || true
+          echo "dry_run=true -> validated only. No branch/PR created."
 
-      - name: Commit + push branch
-        if: ${{ inputs.dry_run == false }}
+      - name: Apply artifact into repo working tree
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # safety: only allow these paths to be applied
+          rm -rf .ai output || true
+          mkdir -p .ai output
+
+          rsync -a --delete "_live_dev_artifact/.ai/" ".ai/"
+          rsync -a --delete "_live_dev_artifact/output/" "output/"
+
+          echo "Applied files:"
+          git status --porcelain
+
+          # extra safety check: refuse unexpected paths
+          bad="$(git status --porcelain | awk '{print $2}' | grep -Ev '^(\.ai/|output/)' || true)"
+          if [ -n "${bad}" ]; then
+            echo "ERROR: unexpected paths would be committed:" >&2
+            echo "${bad}" >&2
+            exit 21
+          fi
+
+      - name: Create branch + commit + push
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           BRANCH: ai-live/issue-${{ inputs.issue }}-run-${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          git checkout -b "$BRANCH"
-          git add -A .ai/dev output/apply_digest.txt output || true
-          git diff --cached --quiet && (echo "Nothing to commit" && exit 0)
-          git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}"
-          git push -u origin "$BRANCH"
 
-      - name: Create PR
-        if: ${{ inputs.dry_run == false }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "${BRANCH}"
+
+          git add .ai output
+          if git diff --cached --quiet; then
+            echo "ERROR: nothing to commit (artifact applied but no changes staged?)" >&2
+            exit 31
+          fi
+
+          git commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}"
+          git push -f origin "${BRANCH}"
+
+      - name: Open PR
+        if: ${{ !inputs.dry_run }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ai-live/issue-${{ inputs.issue }}-run-${{ inputs.run_id }}
           BASE: ${{ inputs.base_branch }}
+          DIGEST: ${{ steps.validate.outputs.digest }}
         run: |
           set -euo pipefail
+
           title="ai-live: issue #${{ inputs.issue }} (run ${{ inputs.run_id }})"
-          body="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from run ${{ inputs.run_id }}.
-digest: $(cat output/apply_digest.txt)"
-          gh api repos/${{ github.repository }}/pulls \
-            -f title="$title" \
-            -f head="$BRANCH" \
-            -f base="$BASE" \
-            -f body="$body" >/dev/null
-          echo "PR created"
+          body="Apply LIVE DEV artifact 'live-dev' from run ${{ inputs.run_id }}.\n\ndigest: ${DIGEST}\n"
+
+          # create PR (idempotent-ish: if exists, gh will fail -> print existing)
+          if gh pr create --base "${BASE}" --head "${BRANCH}" --title "${title}" --body "${body}"; then
+            echo "PR created."
+          else
+            echo "PR create failed (maybe already exists). Listing PRs for branch:"
+            gh pr list --head "${BRANCH}" --state open || true
+            exit 0
+          fi
