@@ -266,6 +266,42 @@ jobs:
             echo "note=${NOTE}"
           } >> "${OUTPUT_DIR}/preflight/summary.txt"
 
+      - name: "Preflight assertions (hard gates)"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Asserting preflight invariants..."
+
+          RUN_LIVE_EFFECTIVE="${{ steps.live_gate.outputs.run_live_effective }}"
+          RUN_LIVE_REQUESTED="${{ steps.live_gate.outputs.run_live_requested }}"
+          APPLY_LIVE_REQUESTED="${{ steps.live_gate.outputs.apply_live_requested }}"
+
+          # apply_live=true is illegal without run_live requested+effective
+          if [ "$APPLY_LIVE_REQUESTED" = "true" ] && [ "$RUN_LIVE_REQUESTED" != "true" ]; then
+            echo "ERROR: apply_live=true but run_live=false"
+            exit 10
+          fi
+
+          if [ "$APPLY_LIVE_REQUESTED" = "true" ] && [ "$RUN_LIVE_EFFECTIVE" != "true" ]; then
+            echo "ERROR: apply_live=true but run_live_effective!=true (LIVE not actually enabled/configured)"
+            exit 11
+          fi
+
+          echo "Preflight assertions PASSED"
+
+      - name: "Write trace info"
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "commit=${GITHUB_SHA}"
+            echo "actor=${GITHUB_ACTOR}"
+            echo "ref=${GITHUB_REF}"
+          } >> "${OUTPUT_DIR}/preflight/trace.txt"
+
       - name: "Upload context artifact"
         uses: actions/upload-artifact@v4
         with:
