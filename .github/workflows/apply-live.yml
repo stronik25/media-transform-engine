@@ -12,20 +12,15 @@ on:
         required: true
         type: string
       base_branch:
-        description: "Base branch to apply onto (usually main)"
+        description: "Base branch (usually main)"
         required: false
         default: "main"
         type: string
-      artifact_name:
-        description: "Artifact name to download (default: live-dev)"
-        required: false
-        default: "live-dev"
-        type: string
       dry_run:
-        description: "true = validate only; false = create branch + PR"
+        description: "If true: validate only (no apply/commit/PR)"
         required: false
-        default: "true"
-        type: string
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -36,7 +31,8 @@ permissions:
 jobs:
   apply_live_dev:
     runs-on: ubuntu-latest
-
+    env:
+      ARTIFACT_NAME: "live-dev"
     steps:
       - name: Checkout base branch
         uses: actions/checkout@v4
@@ -47,21 +43,21 @@ jobs:
       - name: Download LIVE DEV artifact from run_id
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.artifact_name }}
+          name: ${{ env.ARTIFACT_NAME }}
           run-id: ${{ inputs.run_id }}
           path: _live_dev_artifact
-          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate / apply (python)
+      - name: Validate + apply via script
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-          BASE_BRANCH: ${{ inputs.base_branch }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          ARTIFACT_DIR: "_live_dev_artifact"
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/apply_live_dev.py
+          python3 .github/scripts/apply_live_dev.py \
+            --artifact-dir "_live_dev_artifact" \
+            --run-id "${{ inputs.run_id }}" \
+            --issue "${{ inputs.issue }}" \
+            --base-branch "${{ inputs.base_branch }}" \
+            --dry-run "${{ inputs.dry_run }}"
