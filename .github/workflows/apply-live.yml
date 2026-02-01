@@ -1,23 +1,23 @@
-name: "Apply LIVE DEV artifact (manual, by run_id)"
+name: "Apply LIVE DEV (by run_id)"
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Source AI Debug run_id that produced artifact 'live-dev'"
+        description: "AI Debug run_id that contains artifact live-dev"
         required: true
         type: string
       issue:
-        description: "Issue number (e.g. 1). Used for filename and branch naming."
+        description: "Issue number (e.g. 1)"
         required: true
         type: string
       base_branch:
-        description: "Base branch for PR (usually main)."
+        description: "Base branch (usually main)"
         required: true
         default: "main"
         type: string
       dry_run:
-        description: "If true: validate only, do not push branch or create PR."
+        description: "true = validate only (no push/PR)"
         required: true
         default: true
         type: boolean
@@ -25,16 +25,14 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: write
   actions: read
 
 env:
-  ARTIFACT_NAME: "live-dev"
+  ARTIFACT_NAME: live-dev
 
 jobs:
-  apply_live_dev:
+  apply:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,139 +40,76 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Download LIVE DEV artifact from run_id
+      - name: Download artifact (live-dev) from run_id
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           run-id: ${{ inputs.run_id }}
-          path: output/live-dev
+          path: _incoming/live-dev
 
-      - name: Validate artifact contents (fail-fast on error payloads)
+      - name: Block apply if artifact is an error payload
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ ! -d "output/live-dev" ]; then
-            echo "ERROR: output/live-dev folder missing after download."
-            exit 2
-          fi
-
-          # Сигнал что артефакт реально не пустой
-          if ! find "output/live-dev" -type f -maxdepth 4 | head -n 1 | grep -q .; then
-            echo "ERROR: live-dev artifact downloaded but appears empty."
-            exit 3
-          fi
-
-          # Блокируем применение, если внутри есть JSON/MD с явной ошибкой quota/insufficient_quota
-          # (мы НЕ хотим чтобы такое попадало в PR)
-          if rg -n --hidden --no-ignore-vcs -S \
-            '(insufficient_quota|You exceeded your current quota|"error"\s*:)' \
-            "output/live-dev" >/dev/null 2>&1; then
-            echo "ERROR: live-dev artifact contains an error payload (quota/error). Refusing to apply."
-            echo "---- matches ----"
-            rg -n --hidden --no-ignore-vcs -S \
-              '(insufficient_quota|You exceeded your current quota|"error"\s*:)' \
-              "output/live-dev" || true
+          test -d "_incoming/live-dev" || (echo "missing _incoming/live-dev" && exit 2)
+          if grep -RInE --binary-files=without-match '(insufficient_quota|You exceeded your current quota|"error"[[:space:]]*:)' "_incoming/live-dev" >/dev/null 2>&1; then
+            echo "ERROR: live-dev contains error payload (quota/error)."
+            grep -RInE --binary-files=without-match '(insufficient_quota|You exceeded your current quota|"error"[[:space:]]*:)' "_incoming/live-dev" || true
             exit 10
           fi
 
-      - name: Compute digest (traceability)
+      - name: Compute digest + write apply record
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p output
-          # digest по содержимому артефакта (стабильно, без зависимости от zip)
-          # сортируем файлы и считаем sha256 от (sha256(file)+path)
-          tmp="output/_digest_input.txt"
-          : > "$tmp"
-          while IFS= read -r -d '' f; do
-            h="$(sha256sum "$f" | awk '{print $1}')"
-            p="${f#output/live-dev/}"
-            printf "%s  %s\n" "$h" "$p" >> "$tmp"
-          done < <(find output/live-dev -type f -print0 | sort -z)
-
-          DIGEST="$(sha256sum "$tmp" | awk '{print $1}')"
-          echo "$DIGEST" > output/apply_digest.txt
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "Digest: $DIGEST"
-
-      - name: Prepare branch + apply allowlist
-        id: prep
-        shell: bash
-        env:
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
-          BASE: ${{ inputs.base_branch }}
-        run: |
-          set -euo pipefail
-
-          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          echo "branch=$BR" >> "$GITHUB_OUTPUT"
-          echo "Branch: $BR"
-
-          # ВАЖНО: применяем ТОЛЬКО то, что реально должно лечь в репо.
-          # Сейчас у нас артефакт маленький и часто содержит служебные штуки.
-          # Поэтому применяем по allowlist:
-          # - .ai/dev/**   (но НЕ issue_*.md из артефакта — мы генерим свой)
-          # - output/**    (если нужно; при желании можно убрать)
-          #
-          # 1) копируем .ai/dev (если есть)
-          if [ -d "output/live-dev/.ai/dev" ]; then
-            mkdir -p .ai/dev
-            rsync -a --delete \
-              --exclude 'issue_*.md' \
-              "output/live-dev/.ai/dev/" ".ai/dev/"
-          fi
-
-          # 2) копируем output (если есть)
-          if [ -d "output/live-dev/output" ]; then
-            mkdir -p output
-            rsync -a --delete "output/live-dev/output/" "output/"
-          fi
-
-          # 3) генерим нормальный apply-отчёт (вместо error-json)
-          mkdir -p .ai/dev
+          mkdir -p output .ai/dev
+          find _incoming/live-dev -type f -print0 | sort -z | xargs -0 sha256sum > output/_files.sha256
+          sha256sum output/_files.sha256 | awk '{print $1}' > output/apply_digest.txt
           {
             echo "# LIVE DEV apply record"
             echo ""
-            echo "- issue: ${ISSUE}"
-            echo "- run_id: ${RUN_ID}"
-            echo "- base_branch: ${BASE}"
-            echo "- artifact: live-dev"
+            echo "- issue: ${{ inputs.issue }}"
+            echo "- run_id: ${{ inputs.run_id }}"
             echo "- digest: $(cat output/apply_digest.txt)"
             echo "- applied_at_utc: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "- note: generated by apply-live.yml (error payloads are blocked)."
-          } > ".ai/dev/issue_${ISSUE}.md"
+          } > ".ai/dev/issue_${{ inputs.issue }}.md"
 
-      - name: No-op if dry_run=true
+      - name: Apply allowlist (safe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # apply only these folders if present
+          if [ -d "_incoming/live-dev/.ai/dev" ]; then
+            mkdir -p .ai/dev
+            rsync -a --delete --exclude 'issue_*.md' "_incoming/live-dev/.ai/dev/" ".ai/dev/"
+          fi
+          if [ -d "_incoming/live-dev/output" ]; then
+            mkdir -p output
+            rsync -a --delete "_incoming/live-dev/output/" "output/"
+          fi
+          rm -rf _incoming
+
+      - name: Dry run status
         if: ${{ inputs.dry_run == true }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "dry_run=true → validated + staged changes locally, will not push/PR."
+          echo "dry_run=true → no push/PR"
           git status --porcelain || true
 
-      - name: Create branch, commit, push
+      - name: Commit + push branch
         if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
-          BRANCH: ${{ steps.prep.outputs.branch }}
+          BRANCH: ai-live/issue-${{ inputs.issue }}-run-${{ inputs.run_id }}
         run: |
           set -euo pipefail
-
           git checkout -b "$BRANCH"
-
-          # Коммитим только ожидаемые пути (чтобы мусор не попадал)
           git add -A .ai/dev output/apply_digest.txt output || true
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
-          fi
-
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}"
-
+          git diff --cached --quiet && (echo "Nothing to commit" && exit 0)
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "apply-live: issue #${{ inputs.issue }} from run ${{ inputs.run_id }}"
           git push -u origin "$BRANCH"
 
       - name: Create PR
@@ -182,38 +117,16 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.prep.outputs.branch }}
+          BRANCH: ai-live/issue-${{ inputs.issue }}-run-${{ inputs.run_id }}
           BASE: ${{ inputs.base_branch }}
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-
-          title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from workflow run ${RUN_ID}.\n\n- digest: $(cat output/apply_digest.txt)\n- note: error payloads are blocked; apply record is generated in .ai/dev/issue_${ISSUE}.md\n"
-
-          # создаём PR через API (без gh CLI)
-          api="https://api.github.com/repos/${{ github.repository }}/pulls"
-          data="$(python3 - <<'PY'
-import json, os
-print(json.dumps({
-  "title": os.environ["title"] if "title" in os.environ else "",
-  "head": os.environ["BRANCH"],
-  "base": os.environ["BASE"],
-  "body": os.environ["body"] if "body" in os.environ else ""
-}))
-PY
-)"
-          # прокидываем title/body через env безопасно
-          export title="$title"
-          export body="$body"
-
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            --data-binary "$data" \
-            "$api" > output/pr_response.json
-
-          echo "PR response:"
-          cat output/pr_response.json
+          title="ai-live: issue #${{ inputs.issue }} (run ${{ inputs.run_id }})"
+          body="Apply LIVE DEV artifact '${ARTIFACT_NAME}' from run ${{ inputs.run_id }}.
+digest: $(cat output/apply_digest.txt)"
+          gh api repos/${{ github.repository }}/pulls \
+            -f title="$title" \
+            -f head="$BRANCH" \
+            -f base="$BASE" \
+            -f body="$body" >/dev/null
+          echo "PR created"
