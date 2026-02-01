@@ -1,0 +1,45 @@
+name: "AI LIVE trigger (label/comment -> dispatch AI Debug)"
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+env:
+  AI_DEBUG_WORKFLOW_FILE: "ai-debug-3agents.yml"
+  DEFAULT_MAX_USD: "0.50"
+  DEFAULT_MAX_IN: "12000"
+  DEFAULT_MAX_OUT: "1200"
+  DEFAULT_FAIL_ON_CAP: "true"
+  TRIGGER_LABEL: "ai-live"
+  REF: "main"
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: ai-live-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide + dispatch (python, stable)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ai_live_trigger.py
