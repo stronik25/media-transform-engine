@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug run_id that contains artifact live-dev"
+        description: "AI Debug run_id that contains artifact 'live-dev'"
         required: true
         type: string
       issue:
@@ -17,7 +17,7 @@ on:
         default: "main"
         type: string
       dry_run:
-        description: "If true: validate only, do not commit or open PR"
+        description: "If true: validate only, do not commit/PR"
         required: false
         default: true
         type: boolean
@@ -34,100 +34,157 @@ jobs:
     environment: live-apply
 
     steps:
-      - name: Checkout base branch
+      - name: "Checkout base branch"
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.base_branch }}
 
-      - name: Download LIVE DEV artifact
+      - name: "Download LIVE DEV artifact from run_id"
         uses: actions/download-artifact@v4
         with:
           name: live-dev
-          run-id: ${{ inputs.run_id }}
           github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
           path: _live_dev_artifact
 
-      - name: Validate artifact
+      - name: "Validate + normalize artifact contents"
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f "_live_dev_artifact/issue_${{ inputs.issue }}.md"
-          test -f "_live_dev_artifact/request.json"
-          test -f "_live_dev_artifact/response.json"
+          echo "Listing artifact dir:"
+          ls -la _live_dev_artifact || true
+          echo "Tree:"
+          find _live_dev_artifact -maxdepth 3 -type f -print || true
 
-          mkdir -p output
+          # Must contain these files (as produced by ai-debug-3agents.yml)
+          test -f "_live_dev_artifact/issue_${{ inputs.issue }}.md" \
+            || { echo "ERROR: missing _live_dev_artifact/issue_${{ inputs.issue }}.md" >&2; exit 11; }
+          test -f "_live_dev_artifact/request.json" \
+            || { echo "ERROR: missing _live_dev_artifact/request.json" >&2; exit 11; }
+          test -f "_live_dev_artifact/response.json" \
+            || { echo "ERROR: missing _live_dev_artifact/response.json" >&2; exit 11; }
 
-          digest="$(
-            (cd _live_dev_artifact && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
-            | sha256sum | awk '{print $1}'
-          )"
+          # Make sure output dir exists in repo worktree
+          mkdir -p output .ai/dev
 
-          echo "${digest}" > output/apply_digest.txt
+          # Compute a stable digest for traceability (based on artifact content)
+          digest="$( (cd _live_dev_artifact && find . -type f -print0 | sort -z | xargs -0 sha256sum) | sha256sum | awk '{print $1}' )"
+          echo "apply_digest=${digest}" | tee output/apply_digest.txt
 
-      - name: Stop after validation
+      - name: "Stop after validation (dry_run=true)"
         if: ${{ inputs.dry_run == true }}
-        run: echo "dry_run=true → validation OK"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "dry_run=true -> validation complete, stopping."
 
-      - name: Apply artifact to repo
+      - name: "Apply artifact into repo working tree"
         if: ${{ inputs.dry_run == false }}
         shell: bash
         run: |
           set -euo pipefail
-          rsync -a --checksum _live_dev_artifact/ ./
 
-      - name: Create branch and commit
+          # Apply everything from artifact root to repo root (overwrites as needed).
+          # This avoids 'cp same file' and keeps paths stable.
+          rsync -a --checksum \
+            --exclude ".git/" \
+            _live_dev_artifact/ ./
+
+          # Ensure digest file remains in output/ (rsync may have overwritten it)
+          test -f output/apply_digest.txt
+
+      - name: "Create branch + commit + push"
         if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
-          ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
+          ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
           BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -b "${BR}"
+
           git add -A
+          if git diff --cached --quiet; then
+            echo "ERROR: no changes after apply; nothing to commit." >&2
+            exit 12
+          fi
+
           git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}"
           git push --force-with-lease origin "${BR}"
 
-      - name: Open PR
+          echo "branch=${BR}" >> "$GITHUB_OUTPUT"
+
+      - name: "Open PR"
         if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
-          ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
+          ISSUE: ${{ inputs.issue }}
           BASE: ${{ inputs.base_branch }}
         run: |
           set -euo pipefail
 
-          python3 - <<PY
-import json, urllib.request
+          head="ai-live/issue-${ISSUE}-run-${RUN_ID}"
+          title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
+          body="Apply LIVE DEV artifact 'live-dev' from workflow run ${RUN_ID}. Includes digest in output/apply_digest.txt for traceability."
 
-url = f"https://api.github.com/repos/{OWNER}/{REPO}/pulls"
-payload = {
-  "title": f"ai-live: issue #{ISSUE} (run {RUN_ID})",
-  "head": f"ai-live/issue-{ISSUE}-run-{RUN_ID}",
-  "base": BASE,
-  "body": f"Apply LIVE DEV artifact from run {RUN_ID}. Digest in output/apply_digest.txt"
-}
-
-req = urllib.request.Request(
-  url,
-  data=json.dumps(payload).encode(),
-  headers={
-    "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json"
-  },
-  method="POST"
-)
-
-urllib.request.urlopen(req)
+          api="https://api.github.com/repos/${OWNER}/${REPO}/pulls"
+          payload="$(python3 - <<'PY'
+import json, os
+print(json.dumps({
+  "title": os.environ["title"] if "title" in os.environ else "",
+  "head": os.environ["head"] if "head" in os.environ else "",
+  "base": os.environ["BASE"],
+  "body": os.environ["body"] if "body" in os.environ else ""
+}))
 PY
+)"
+          # inject vars safely (no jq dependency)
+          payload="$(python3 - <<PY
+import json, os
+p = {
+  "title": os.environ["TITLE"],
+  "head": os.environ["HEAD"],
+  "base": os.environ["BASE"],
+  "body": os.environ["BODY"],
+}
+print(json.dumps(p))
+PY
+)" || true
+
+          # Simpler: build payload directly
+          payload="$(python3 - <<PY
+import json, os
+print(json.dumps({
+  "title": f"ai-live: issue #{os.environ['ISSUE']} (run {os.environ['RUN_ID']})",
+  "head": f"ai-live/issue-{os.environ['ISSUE']}-run-{os.environ['RUN_ID']}",
+  "base": os.environ["BASE"],
+  "body": f"Apply LIVE DEV artifact 'live-dev' from workflow run {os.environ['RUN_ID']}. Includes digest in output/apply_digest.txt for traceability."
+}))
+PY
+)"
+
+          code="$(curl -sS -o pr.json -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "${payload}" \
+            "${api}")"
+
+          if [ "${code}" != "201" ]; then
+            echo "ERROR: failed to open PR (expected 201). http_code=${code}" >&2
+            cat pr.json >&2 || true
+            exit 13
+          fi
+
+          pr_url="$(python3 -c "import json; print(json.load(open('pr.json'))['html_url'])")"
+          echo "PR: ${pr_url}"
