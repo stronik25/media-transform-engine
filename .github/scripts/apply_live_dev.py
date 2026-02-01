@@ -1,178 +1,160 @@
 #!/usr/bin/env python3
-import hashlib
-import json
+from __future__ import annotations
+
+import argparse
 import os
+import shutil
 import subprocess
-import sys
 from pathlib import Path
-import urllib.request
-import urllib.error
+from typing import List
+
+from gh_api import create_pull_request, comment_issue
 
 
-def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        check=check,
-        text=True,
-        capture_output=capture,
+def sh(cmd: List[str], cwd: str | None = None) -> str:
+    p = subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
+    return p.stdout.strip()
+
+
+def ensure_clean_paths(dest: Path) -> None:
+    # We only allow writing into these prefixes (safety gate)
+    allowed_prefixes = [
+        Path(".ai") / "dev",
+        Path("output"),
+    ]
+    dest_rel = dest.as_posix()
+    ok = any(dest == p or str(dest).startswith(str(p) + "/") for p in allowed_prefixes)
+    if not ok:
+        raise RuntimeError(f"Refusing to write outside allowed paths: {dest_rel}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--artifact-dir", required=True)
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--issue", required=True)
+    ap.add_argument("--base-branch", default="main")
+    ap.add_argument("--dry-run", default="true")
+    args = ap.parse_args()
+
+    artifact_dir = Path(args.artifact_dir).resolve()
+    if not artifact_dir.exists():
+        raise SystemExit(f"artifact-dir not found: {artifact_dir}")
+
+    dry_run = str(args.dry_run).lower() in ("1", "true", "yes", "y")
+
+    # Normalize artifact contents:
+    # Accept either:
+    #  - issue_1.md / request.json / response.json at root
+    #  - .ai/dev/issue_1.md etc
+    expected_issue_md = f"issue_{args.issue}.md"
+
+    # Locate files
+    candidates_issue = [
+        artifact_dir / expected_issue_md,
+        artifact_dir / ".ai" / "dev" / expected_issue_md,
+    ]
+    issue_path = next((p for p in candidates_issue if p.exists()), None)
+    if issue_path is None:
+        tree = "\n".join(sorted(str(p.relative_to(artifact_dir)) for p in artifact_dir.rglob("*")))
+        raise SystemExit(f"Missing {expected_issue_md} in artifact.\nArtifact tree:\n{tree}")
+
+    candidates_req = [artifact_dir / "request.json", artifact_dir / ".ai" / "dev" / "request.json"]
+    req_path = next((p for p in candidates_req if p.exists()), None)
+
+    candidates_resp = [artifact_dir / "response.json", artifact_dir / ".ai" / "dev" / "response.json"]
+    resp_path = next((p for p in candidates_resp if p.exists()), None)
+
+    # Prepare repo destination
+    dest_dir = Path(".ai") / "dev"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_issue = dest_dir / expected_issue_md
+    ensure_clean_paths(dest_issue)
+    shutil.copyfile(issue_path, dest_issue)
+
+    if req_path is not None:
+        dest_req = dest_dir / "request.json"
+        ensure_clean_paths(dest_req)
+        shutil.copyfile(req_path, dest_req)
+
+    if resp_path is not None:
+        dest_resp = dest_dir / "response.json"
+        ensure_clean_paths(dest_resp)
+        shutil.copyfile(resp_path, dest_resp)
+
+    # Write apply digest (traceability)
+    out_dir = Path("output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest_digest = out_dir / "apply_digest.txt"
+    ensure_clean_paths(dest_digest)
+
+    digest_value = f"run_id={args.run_id} issue={args.issue}"
+    dest_digest.write_text(digest_value + "\n", encoding="utf-8")
+
+    print(f"OK: normalized + staged files. dry_run={dry_run}")
+
+    if dry_run:
+        print("Dry-run: stopping before git commit/PR.")
+        return
+
+    # Git apply: create branch, commit, push
+    base = args.base_branch
+    branch = f"ai-live/issue-{args.issue}-run-{args.run_id}"
+
+    sh(["git", "checkout", base])
+    sh(["git", "pull", "--ff-only", "origin", base])
+    sh(["git", "checkout", "-B", branch])
+
+    sh(["git", "add", str(dest_issue), str(out_dir / "apply_digest.txt")])
+    if req_path is not None:
+        sh(["git", "add", str(dest_dir / "request.json")])
+    if resp_path is not None:
+        sh(["git", "add", str(dest_dir / "response.json")])
+
+    # Commit only if there are changes
+    status = sh(["git", "status", "--porcelain"])
+    if status.strip() == "":
+        print("No changes to commit.")
+    else:
+        msg = f"apply-live: issue #{args.issue} from run {args.run_id}"
+        sh(["git", "commit", "-m", msg])
+
+    sh(["git", "push", "--force-with-lease", "origin", branch])
+
+    # Open PR
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise SystemExit("Missing GH_TOKEN/GITHUB_TOKEN in env")
+
+    owner = os.environ.get("OWNER")
+    repo = os.environ.get("REPO")
+    if not owner or not repo:
+        raise SystemExit("Missing OWNER/REPO env")
+
+    title = f"ai-live: issue #{args.issue} (run {args.run_id})"
+    body = f"Apply LIVE DEV artifact 'live-dev' from workflow run {args.run_id}.\n\nTrace: output/apply_digest.txt"
+    pr = create_pull_request(
+        owner=owner,
+        repo=repo,
+        token=token,
+        title=title,
+        head=branch,
+        base=base,
+        body=body,
+    )
+    pr_url = pr.get("html_url", "")
+    print(f"PR: {pr_url}")
+
+    # Comment back to issue
+    comment_issue(
+        owner=owner,
+        repo=repo,
+        token=token,
+        issue=str(args.issue),
+        body=f"Opened PR: {pr_url}",
     )
 
 
-def gh_api(method: str, url: str, token: str, payload: dict | None = None) -> tuple[int, str]:
-    data = None
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "apply-live-dev",
-    }
-    if payload is not None:
-        body = json.dumps(payload).encode("utf-8")
-        data = body
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url=url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.getcode(), resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return 0, f"{type(e).__name__}: {e}"
-
-
-def sha256_file(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def main() -> int:
-    repo = os.environ.get("REPO", "").strip()
-    token = os.environ.get("GH_TOKEN", "").strip()
-    run_id = os.environ.get("RUN_ID", "").strip()
-    issue = os.environ.get("ISSUE", "").strip()
-    base_branch = os.environ.get("BASE_BRANCH", "main").strip()
-    dry_run = os.environ.get("DRY_RUN", "true").strip().lower() == "true"
-    artifact_dir = Path(os.environ.get("ARTIFACT_DIR", "_live_dev_artifact")).resolve()
-
-    if "/" not in repo:
-        print("ERROR: REPO missing/invalid", file=sys.stderr)
-        return 2
-    owner, name = repo.split("/", 1)
-
-    if not run_id.isdigit():
-        print(f"ERROR: RUN_ID must be numeric, got: {run_id}", file=sys.stderr)
-        return 2
-    if not issue.isdigit():
-        print(f"ERROR: ISSUE must be numeric, got: {issue}", file=sys.stderr)
-        return 2
-
-    if not artifact_dir.exists() or not artifact_dir.is_dir():
-        print(f"ERROR: artifact dir not found: {artifact_dir}", file=sys.stderr)
-        return 11
-
-    # Expected files in artifact root:
-    #  issue_1.md (or any issue_*.md), request.json, response.json
-    md_files = sorted(artifact_dir.glob("issue_*.md"))
-    req_json = artifact_dir / "request.json"
-    resp_json = artifact_dir / "response.json"
-
-    missing = []
-    if not md_files:
-        missing.append("issue_*.md")
-    if not req_json.exists():
-        missing.append("request.json")
-    if not resp_json.exists():
-        missing.append("response.json")
-
-    if missing:
-        print("ERROR: missing files in artifact:", file=sys.stderr)
-        for m in missing:
-            print(f" - {m}", file=sys.stderr)
-        print(f"Artifact tree ({artifact_dir}):", file=sys.stderr)
-        for p in sorted(artifact_dir.rglob("*")):
-            print(f" - {p.relative_to(artifact_dir)}", file=sys.stderr)
-        return 11
-
-    # Pick the matching issue md if present; else first
-    target_md = None
-    for p in md_files:
-        if p.stem == f"issue_{issue}":
-            target_md = p
-            break
-    if target_md is None:
-        target_md = md_files[0]
-
-    # Compute digest of canonical inputs
-    digest_payload = {
-        "run_id": run_id,
-        "issue": issue,
-        "issue_md": target_md.read_text(encoding="utf-8", errors="replace"),
-        "request_json": req_json.read_text(encoding="utf-8", errors="replace"),
-        "response_json": resp_json.read_text(encoding="utf-8", errors="replace"),
-    }
-    digest_bytes = json.dumps(digest_payload, sort_keys=True).encode("utf-8")
-    apply_digest = hashlib.sha256(digest_bytes).hexdigest()
-    print(f"apply_digest: {apply_digest}")
-
-    if dry_run:
-        print("DRY_RUN=true -> validation only, no repo changes, no PR.")
-        return 0
-
-    # Apply into repo working tree
-    ai_dev_dir = Path(".ai/dev")
-    out_dir = Path("output")
-    ai_dev_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write canonical files (overwrite ok)
-    dest_issue = ai_dev_dir / f"issue_{issue}.md"
-    dest_req = ai_dev_dir / "request.json"
-    dest_resp = ai_dev_dir / "response.json"
-    dest_digest = out_dir / "apply_digest.txt"
-
-    dest_issue.write_text(target_md.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    dest_req.write_text(req_json.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    dest_resp.write_text(resp_json.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-    dest_digest.write_text(apply_digest + "\n", encoding="utf-8")
-
-    # Git branch + commit + push
-    head_branch = f"ai-live/issue-{issue}-run-{run_id}"
-    run(["git", "status", "--porcelain"], check=True)
-
-    run(["git", "checkout", "-B", head_branch, base_branch], check=True)
-    run(["git", "add", str(dest_issue), str(dest_req), str(dest_resp), str(dest_digest)], check=True)
-
-    # If nothing changed, stop
-    diff = run(["git", "diff", "--cached", "--name-only"], capture=True).stdout.strip()
-    if not diff:
-        print("No changes to commit (already applied).")
-        return 0
-
-    msg = f"apply-live: issue #{issue} from run {run_id}"
-    run(["git", "commit", "-m", msg], check=True)
-    run(["git", "push", "-f", "origin", head_branch], check=True)
-
-    if not token:
-        print("WARN: GH_TOKEN missing -> pushed branch but cannot open PR.", file=sys.stderr)
-        return 0
-
-    # Open PR
-    pr_url = f"https://api.github.com/repos/{owner}/{name}/pulls"
-    title = f"ai-live: issue #{issue} (run {run_id})"
-    body = f"Apply LIVE DEV artifact 'live-dev' from workflow run {run_id}. Includes digest for traceability."
-    payload = {"title": title, "head": head_branch, "base": base_branch, "body": body}
-
-    code, resp = gh_api("POST", pr_url, token, payload)
-    if code not in (200, 201):
-        print(f"ERROR: failed to open PR http={code}", file=sys.stderr)
-        print(resp, file=sys.stderr)
-        return 13
-
-    print("OK: PR opened")
-    return 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
