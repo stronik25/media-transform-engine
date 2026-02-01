@@ -23,38 +23,50 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
 
+    concurrency:
+      group: ai-live-${{ github.repository }}-${{ github.event.issue.number || github.event.issue.number }}
+      cancel-in-progress: true
+
     steps:
       - name: "Extract event fields (stable)"
         id: ev
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -c "import json,os; e=json.load(open(os.environ['GITHUB_EVENT_PATH'],'r',encoding='utf-8')); \
-issue=str((e.get('issue') or {}).get('number','')).strip(); \
-label=str((e.get('label') or {}).get('name','')).strip(); \
-body=str((e.get('comment') or {}).get('body','')).replace('\\r','').replace('\\n',' ').strip(); \
-assoc=str((e.get('comment') or {}).get('author_association','')).strip(); \
-out=os.environ['GITHUB_OUTPUT']; \
-open(out,'a',encoding='utf-8').write(f'issue_num={issue}\\nlabel_name={label}\\ncomment_body={body}\\nauthor_assoc={assoc}\\n'); \
-print('issue_num=',issue); print('label_name=',label); print('author_assoc=',assoc)"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const p = context.payload || {};
+            const eventName = context.eventName || "";
+            const issueNum = String(p.issue?.number ?? "").trim();
+            const labelName = String(p.label?.name ?? "").trim();
+            const commentBody = String(p.comment?.body ?? "").replace(/\r/g, "").replace(/\n/g, " ").trim();
+            const authorAssoc = String(p.comment?.author_association ?? "").trim();
+
+            core.setOutput("event_name", eventName);
+            core.setOutput("issue_num", issueNum);
+            core.setOutput("label_name", labelName);
+            core.setOutput("comment_body", commentBody);
+            core.setOutput("author_assoc", authorAssoc);
+
+            core.info(`event_name=${eventName}`);
+            core.info(`issue_num=${issueNum}`);
+            core.info(`label_name=${labelName}`);
+            core.info(`author_assoc=${authorAssoc}`);
 
       - name: "Decide"
         id: decide
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ steps.ev.outputs.event_name }}
           ISSUE_NUM: ${{ steps.ev.outputs.issue_num }}
           LABEL_NAME: ${{ steps.ev.outputs.label_name }}
           COMMENT_BODY: ${{ steps.ev.outputs.comment_body }}
           AUTHOR_ASSOC: ${{ steps.ev.outputs.author_assoc }}
-          TRIGGER_LABEL: ${{ env.TRIGGER_LABEL }}
         run: |
           set -euo pipefail
 
           should="false"
           reason=""
 
-          if [ -z "${ISSUE_NUM}" ]; then
+          if [ -z "${ISSUE_NUM:-}" ]; then
             echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
             echo "issue_num=" >> "$GITHUB_OUTPUT"
             echo "reason=no_issue" >> "$GITHUB_OUTPUT"
@@ -62,7 +74,7 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           fi
 
           if [ "${EVENT_NAME}" = "issues" ]; then
-            if [ "${LABEL_NAME}" = "${TRIGGER_LABEL}" ]; then
+            if [ "${LABEL_NAME:-}" = "${TRIGGER_LABEL}" ]; then
               should="true"
               reason="label"
             else
@@ -72,13 +84,13 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           fi
 
           if [ "${EVENT_NAME}" = "issue_comment" ]; then
-            assoc="$(printf "%s" "${AUTHOR_ASSOC}" | tr '[:upper:]' '[:lower:]')"
+            assoc="$(printf "%s" "${AUTHOR_ASSOC:-}" | tr '[:upper:]' '[:lower:]')"
             case "${assoc}" in
               owner|member|collaborator) ;;
               *)
                 should="false"
                 reason="untrusted_author_association"
-                echo "Not dispatching: author_association=${AUTHOR_ASSOC}" >&2
+                echo "Not dispatching: author_association=${AUTHOR_ASSOC:-}" >&2
                 echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
                 echo "issue_num=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
                 echo "reason=${reason}" >> "$GITHUB_OUTPUT"
@@ -86,7 +98,7 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
                 ;;
             esac
 
-            body="$(printf "%s" "${COMMENT_BODY}" | tr -d '\r')"
+            body="$(printf "%s" "${COMMENT_BODY:-}" | tr -d '\r')"
             if printf "%s" "${body}" | grep -Eq '(^|[[:space:]])/ai[[:space:]]+live(-run)?([[:space:]]|$)'; then
               should="true"
               reason="comment"
@@ -101,16 +113,6 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
           echo "should_dispatch=${should} reason=${reason} issue_num=${ISSUE_NUM}"
 
-      - name: "Concurrency key (stable per issue)"
-        id: conc
-        if: ${{ steps.decide.outputs.should_dispatch == 'true' }}
-        shell: bash
-        env:
-          ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
-        run: |
-          set -euo pipefail
-          echo "group=ai-live-${{ github.repository }}-issue-${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
-
       - name: "Dispatch AI Debug (run_live=true, apply_live=false)"
         id: dispatch_ai
         if: ${{ steps.decide.outputs.should_dispatch == 'true' }}
@@ -120,35 +122,29 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
-          AI_DEBUG_WORKFLOW_FILE: ${{ env.AI_DEBUG_WORKFLOW_FILE }}
-          REF: ${{ env.REF }}
-          DEFAULT_MAX_USD: ${{ env.DEFAULT_MAX_USD }}
-          DEFAULT_MAX_IN: ${{ env.DEFAULT_MAX_IN }}
-          DEFAULT_MAX_OUT: ${{ env.DEFAULT_MAX_OUT }}
-          DEFAULT_FAIL_ON_CAP: ${{ env.DEFAULT_FAIL_ON_CAP }}
         run: |
           set -euo pipefail
-          mkdir -p output
 
+          mkdir -p output
           python3 -c "import json,os; payload={'ref':os.environ['REF'],'inputs':{'issue':os.environ['ISSUE_NUM'],'run_live':'true','apply_live':'false','live_max_usd':os.environ['DEFAULT_MAX_USD'],'live_max_input_tokens':os.environ['DEFAULT_MAX_IN'],'live_max_output_tokens':os.environ['DEFAULT_MAX_OUT'],'live_fail_on_cap':os.environ['DEFAULT_FAIL_ON_CAP']}}; json.dump(payload,open('output/dispatch.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)"
 
-          api=\"https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches\"
-          code=\"$(curl -sS -o output/dispatch_response.txt -w \"%{http_code}\" -X POST \
-            -H \"Authorization: Bearer ${GH_TOKEN}\" \
-            -H \"Accept: application/vnd.github+json\" \
-            -H \"Content-Type: application/json\" \
-            --data-binary \"@output/dispatch.json\" \
-            \"${api}\")\"
+          api="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}/dispatches"
+          code="$(curl -sS -o output/dispatch_response.txt -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            --data-binary "@output/dispatch.json" \
+            "${api}")"
 
-          if [ \"${code}\" != \"204\" ]; then
-            echo \"ERROR: dispatch failed (expected 204). http_code=${code}\" >&2
+          if [ "${code}" != "204" ]; then
+            echo "ERROR: dispatch failed (expected 204). http_code=${code}" >&2
             cat output/dispatch_response.txt >&2 || true
             exit 7
           fi
 
-          echo \"dispatched=true\" >> \"$GITHUB_OUTPUT\"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
 
-      - name: "Comment back (no run_id; points to workflow page)"
+      - name: "Comment back"
         if: ${{ steps.decide.outputs.should_dispatch == 'true' && steps.dispatch_ai.outputs.dispatched == 'true' }}
         shell: bash
         env:
@@ -157,11 +153,10 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
           REASON: ${{ steps.decide.outputs.reason }}
-          AI_DEBUG_WORKFLOW_FILE: ${{ env.AI_DEBUG_WORKFLOW_FILE }}
         run: |
           set -euo pipefail
           wf="https://github.com/${OWNER}/${REPO}/actions/workflows/${AI_DEBUG_WORKFLOW_FILE}"
-          msg="Dispatched AI Debug LIVE run (no apply). Trigger=${REASON}. Open workflow runs: ${wf} (pick the newest run). Next: run apply-live.yml by run_id after live-dev exists."
+          msg="Dispatched AI Debug LIVE run (no apply). Trigger=${REASON}. Track runs: ${wf}. Next: run apply-live.yml by run_id after live-dev exists."
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/comments"
           curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -178,7 +173,6 @@ print('issue_num=',issue); print('label_name=',label); print('author_assoc=',ass
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           ISSUE_NUM: ${{ steps.decide.outputs.issue_num }}
-          TRIGGER_LABEL: ${{ env.TRIGGER_LABEL }}
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE_NUM}/labels/${TRIGGER_LABEL}"
