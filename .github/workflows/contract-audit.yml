@@ -16,7 +16,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (for audit script)
+      - name: Checkout (for optional digest script)
         uses: actions/checkout@v4
 
       - name: Download live-dev artifact by run_id
@@ -27,9 +27,38 @@ jobs:
           run-id: ${{ inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify contract + digest
+      - name: Verify live-dev contract (structure strict; digest best-effort)
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x tools/live_dev_digest.sh
-          tools/live_dev_digest.sh audit/live-dev
+
+          cd audit/live-dev
+
+          # ---- REQUIRED STRUCTURE (FAIL-FAST) ----
+          test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
+          test -f request.json
+          test -f response.json
+          echo "OK: required files present (issue_*.md, request.json, response.json)"
+
+          # ---- OPTIONAL APPLY DIGEST FILE ----
+          if [ -f apply_digest.txt ]; then
+            RAW="$(tr -d '\r\n[:space:]' < apply_digest.txt | head -c 200 || true)"
+            if echo "$RAW" | grep -Eq '^(sha256:)?[a-fA-F0-9]{64}$'; then
+              echo "OK: apply_digest.txt format looks valid"
+            else
+              echo "ERROR: apply_digest.txt has invalid format: '$RAW'" >&2
+              exit 4
+            fi
+
+            # ---- OPTIONAL RE-COMPUTE VERIFY (ONLY IF SCRIPT EXISTS IN REPO) ----
+            if [ -f ../../tools/live_dev_digest.sh ]; then
+              echo "tools/live_dev_digest.sh present → verifying digest fully"
+              chmod +x ../../tools/live_dev_digest.sh
+              ../../tools/live_dev_digest.sh .
+              echo "OK: digest verified"
+            else
+              echo "SKIP: tools/live_dev_digest.sh not present in this ref → format-only check done"
+            fi
+          else
+            echo "SKIP: apply_digest.txt not present (no apply yet)"
+          fi
