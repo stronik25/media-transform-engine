@@ -60,7 +60,7 @@ jobs:
             --dir "_live_dev_artifact"
 
           echo "Downloaded artifact tree:"
-          find _live_dev_artifact -maxdepth 8 -type f -print
+          find _live_dev_artifact -maxdepth 10 -type f -print
 
       - name: Normalize -> apply_ready/
         shell: bash
@@ -69,25 +69,25 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf apply_ready
-          mkdir -p apply_ready/.ai/dev apply_ready/output
+          mkdir -p apply_ready/ai/dev apply_ready/output
 
           want="issue_${ISSUE}.md"
           found="$(find _live_dev_artifact -type f -name "${want}" | head -n 1 || true)"
           if [ -z "${found}" ]; then
             echo "ERROR: missing ${want} anywhere in artifact" >&2
             echo "Tree dump:" >&2
-            find _live_dev_artifact -maxdepth 10 -type f -print >&2 || true
+            find _live_dev_artifact -maxdepth 15 -type f -print >&2 || true
             exit 11
           fi
 
-          cp -f "${found}" "apply_ready/.ai/dev/${want}"
+          cp -f "${found}" "apply_ready/ai/dev/${want}"
 
           req="$(find _live_dev_artifact -type f -name "request.json"  | head -n 1 || true)"
           res="$(find _live_dev_artifact -type f -name "response.json" | head -n 1 || true)"
           if [ -n "${req}" ]; then cp -f "${req}" "apply_ready/request.json"; fi
           if [ -n "${res}" ]; then cp -f "${res}" "apply_ready/response.json"; fi
 
-          digest_inputs="apply_ready/.ai/dev/${want}"
+          digest_inputs="apply_ready/ai/dev/${want}"
           [ -f "apply_ready/request.json" ] && digest_inputs="${digest_inputs} apply_ready/request.json"
           [ -f "apply_ready/response.json" ] && digest_inputs="${digest_inputs} apply_ready/response.json"
 
@@ -96,7 +96,7 @@ jobs:
           echo "apply_digest: ${digest}"
 
           echo "apply_ready tree:"
-          find apply_ready -maxdepth 8 -type f -print
+          find apply_ready -maxdepth 10 -type f -print
 
       - name: Upload apply-ready artifact
         uses: actions/upload-artifact@v4
@@ -144,7 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find apply_ready -maxdepth 8 -type f -print
+          find apply_ready -maxdepth 10 -type f -print
 
       - name: Apply artifact into repo working tree
         shell: bash
@@ -154,11 +154,11 @@ jobs:
           set -euo pipefail
 
           want="issue_${ISSUE}.md"
-          src="apply_ready/.ai/dev/${want}"
+          src="apply_ready/ai/dev/${want}"
 
           if [ ! -f "${src}" ]; then
             echo "ERROR: expected file missing: ${src}" >&2
-            find apply_ready -maxdepth 10 -type f -print >&2 || true
+            find apply_ready -maxdepth 15 -type f -print >&2 || true
             exit 31
           fi
 
