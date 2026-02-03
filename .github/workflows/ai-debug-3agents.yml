@@ -600,9 +600,36 @@ jobs:
           name: live-qa
           path: qa_live_artifacts
 
-  apply_live_dev:
+  contract_audit_live_dev:
     runs-on: ubuntu-latest
     needs: [preflight, qa_live]
+    if: ${{ needs.preflight.outputs.run_live_effective == 'true' }}
+    steps:
+      - name: "Checkout (for audit script)"
+        uses: actions/checkout@v4
+
+      - name: "Download LIVE DEV artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: live-dev
+          path: audit/live-dev
+
+      - name: "Verify live-dev contract + digest (FAIL-FAST)"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d audit/live-dev
+          chmod +x tools/live_dev_digest.sh
+
+          # tools/live_dev_digest.sh should fail if contract/digest invalid
+          tools/live_dev_digest.sh audit/live-dev
+
+          echo "OK: contract audit passed"
+
+  apply_live_dev:
+    runs-on: ubuntu-latest
+    needs: [preflight, qa_live, contract_audit_live_dev]
     if: ${{ needs.preflight.outputs.run_live_effective == 'true' && needs.preflight.outputs.apply_live_requested == 'true' }}
     steps:
       - name: "Apply is gated"
