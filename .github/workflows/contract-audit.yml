@@ -8,12 +8,6 @@ on:
         required: true
         type: string
 
-  workflow_run:
-    workflows:
-      - "AI Debug (v5 gates; v4 deterministic default)"
-    types:
-      - completed
-
 permissions:
   actions: read
   contents: read
@@ -21,66 +15,21 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    if: >
-      ${{
-        (github.event_name == 'workflow_dispatch') ||
-        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
-      }}
     steps:
-      - name: Checkout (for optional digest script)
+      - name: Checkout (for audit script)
         uses: actions/checkout@v4
 
-      - name: Resolve run id
-        id: rid
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run_id=${{ inputs.run_id }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_id=${{ github.event.workflow_run.id }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download live-dev artifact by run_id (fail-fast if missing)
+      - name: Download live-dev artifact by run_id
         uses: actions/download-artifact@v4
         with:
           name: live-dev
           path: audit/live-dev
-          run-id: ${{ steps.rid.outputs.run_id }}
+          run-id: ${{ inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify live-dev contract (structure strict; digest best-effort)
+      - name: Verify contract + digest
         shell: bash
         run: |
           set -euo pipefail
-
-          cd audit/live-dev
-
-          # ---- REQUIRED STRUCTURE (FAIL-FAST) ----
-          test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
-          test -f request.json
-          test -f response.json
-          echo "OK: required files present (issue_*.md, request.json, response.json)"
-
-          # ---- OPTIONAL APPLY DIGEST FILE ----
-          if [ -f apply_digest.txt ]; then
-            RAW="$(tr -d '\r\n[:space:]' < apply_digest.txt | head -c 200 || true)"
-            if echo "$RAW" | grep -Eq '^(sha256:)?[a-fA-F0-9]{64}$'; then
-              echo "OK: apply_digest.txt format looks valid"
-            else
-              echo "ERROR: apply_digest.txt has invalid format: '$RAW'" >&2
-              exit 4
-            fi
-
-            # ---- OPTIONAL RE-COMPUTE VERIFY (ONLY IF SCRIPT EXISTS IN REPO) ----
-            if [ -f ../../tools/live_dev_digest.sh ]; then
-              echo "tools/live_dev_digest.sh present → verifying digest fully"
-              chmod +x ../../tools/live_dev_digest.sh
-              ../../tools/live_dev_digest.sh .
-              echo "OK: digest verified"
-            else
-              echo "SKIP: tools/live_dev_digest.sh not present in this ref → format-only check done"
-            fi
-          else
-            echo "SKIP: apply_digest.txt not present (no apply yet)"
-          fi
+          chmod +x tools/live_dev_digest.sh
+          tools/live_dev_digest.sh audit/live-dev
