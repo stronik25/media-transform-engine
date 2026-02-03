@@ -70,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p _live_dev_artifact_norm/.ai/dev
+          mkdir -p _live_dev_artifact_norm/.ai/dev output
 
           want="issue_${ISSUE}.md"
           found="$(find _live_dev_artifact -type f -name "${want}" | head -n 1 || true)"
@@ -96,9 +96,9 @@ jobs:
           [ -f "_live_dev_artifact_norm/request.json" ]  && digest_inputs="${digest_inputs} _live_dev_artifact_norm/request.json"
           [ -f "_live_dev_artifact_norm/response.json" ] && digest_inputs="${digest_inputs} _live_dev_artifact_norm/response.json"
 
+          # shellcheck disable=SC2086
           digest="$(sha256sum ${digest_inputs} | sha256sum | awk '{print $1}')"
           echo "${digest}" > output/apply_digest.txt
-          echo "apply_digest: ${digest}"
 
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "has_issue_file=true" >> "$GITHUB_OUTPUT"
@@ -129,9 +129,6 @@ jobs:
     if: ${{ inputs.dry_run == false }}
     needs: [validate]
     runs-on: ubuntu-latest
-
-    # If your plan supports environment approvals, this will enforce it.
-    # If not supported, it will NOT provide UI approval gating.
     environment: live-apply
 
     steps:
@@ -151,7 +148,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "apply_ready tree:"
           find apply_ready -maxdepth 6 -type f -print
 
       - name: Apply artifact into repo working tree
@@ -179,8 +175,6 @@ jobs:
           fi
 
           cp -f "apply_ready/output/apply_digest.txt" "output/apply_digest.txt"
-
-          echo "Working tree changes:"
           git status --porcelain
 
       - name: Create branch + commit + push (skip if no changes)
@@ -199,7 +193,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "no_changes=true" >> "$GITHUB_OUTPUT"
             echo "branch=${BR}" >> "$GITHUB_OUTPUT"
-            echo "No changes vs base. Nothing to PR."
             exit 0
           fi
 
@@ -216,7 +209,7 @@ jobs:
         if: ${{ steps.push.outputs.no_changes == 'false' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LIVE_APPLY_PAT }}
           RUN_ID: ${{ inputs.run_id }}
           ISSUE: ${{ inputs.issue }}
           BASE: ${{ inputs.base_branch }}
@@ -225,27 +218,21 @@ jobs:
           set -euo pipefail
 
           title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="$(cat <<EOF
-Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}.
-Digest: see output/apply_digest.txt.
-EOF
-)"
+          body="$(printf "Apply LIVE DEV artifact 'live-dev' from AI Debug run %s.\nDigest: see output/apply_digest.txt.\n" "${RUN_ID}")"
 
-          existing_url="$(gh pr list --head "${BRANCH}" --state open --json url -q '.[0].url' || true)"
+          existing_url="$(gh pr list --head "${BRANCH}" --state open --json url -q '.[0].url' 2>/dev/null || true)"
           if [ -n "${existing_url}" ]; then
-            echo "Reusing existing PR: ${existing_url}"
             echo "pr_url=${existing_url}" >> "$GITHUB_ENV"
             exit 0
           fi
 
           url="$(gh pr create --head "${BRANCH}" --base "${BASE}" --title "${title}" --body "${body}")"
-          echo "Opened PR: ${url}"
           echo "pr_url=${url}" >> "$GITHUB_ENV"
 
       - name: Comment back to issue (always; even if no changes)
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LIVE_APPLY_PAT }}
           ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
           BRANCH: ${{ steps.push.outputs.branch }}
