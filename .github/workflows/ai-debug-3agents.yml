@@ -416,11 +416,16 @@ jobs:
 
           python3 "$PY"
 
-          curl -sS https://api.openai.com/v1/responses \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d @output/live/arch/request.json \
-            > output/live/arch/response.json
+          curl --retry 5 \
+               --retry-all-errors \
+               --retry-delay 2 \
+               --connect-timeout 15 \
+               --max-time 120 \
+               -sS https://api.openai.com/v1/responses \
+               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+               -H "Content-Type: application/json" \
+               -d @output/live/arch/request.json \
+               > output/live/arch/response.json
 
           test -s output/live/arch/response.json
 
@@ -492,11 +497,16 @@ jobs:
 
           python3 "$PY"
 
-          curl -sS https://api.openai.com/v1/responses \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d @output/live/dev/request.json \
-            > output/live/dev/response.json
+          curl --retry 5 \
+               --retry-all-errors \
+               --retry-delay 2 \
+               --connect-timeout 15 \
+               --max-time 120 \
+               -sS https://api.openai.com/v1/responses \
+               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+               -H "Content-Type: application/json" \
+               -d @output/live/dev/request.json \
+               > output/live/dev/response.json
 
           test -s output/live/dev/response.json
 
@@ -524,6 +534,40 @@ jobs:
           printf "%s\n" "print('Wrote',p)" >> "$PY2"
 
           python3 "$PY2"
+
+      - name: "Write apply_digest.txt (contract v1)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          cd output/live/dev
+
+          # Required files (contract)
+          test -f request.json
+          test -f response.json
+          test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
+
+          MANIFEST_FILE="$(mktemp)"
+          cleanup() { rm -f "${MANIFEST_FILE}"; }
+          trap cleanup EXIT
+
+          # Order: issue_*.md (sorted) + request.json + response.json
+          for f in $(ls -1 issue_*.md | sort); do
+            H="$(sha256sum "$f" | awk '{print $1}')"
+            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
+          done
+
+          for f in request.json response.json; do
+            H="$(sha256sum "$f" | awk '{print $1}')"
+            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
+          done
+
+          FINAL="$(sha256sum "${MANIFEST_FILE}" | awk '{print $1}')"
+          printf "sha256:%s\n" "${FINAL}" > apply_digest.txt
+
+          test -s apply_digest.txt
+          echo "OK: wrote apply_digest.txt sha256:${FINAL}"
 
       - name: "Upload LIVE DEV artifact"
         uses: actions/upload-artifact@v4
