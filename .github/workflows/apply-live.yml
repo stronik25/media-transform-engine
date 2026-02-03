@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "AI Debug run_id that contains artifact live-dev"
+        description: "AI Debug run_id (the BIG number from /actions/runs/<id>) that contains artifact live-dev"
         required: true
         type: string
       issue:
@@ -29,16 +29,10 @@ permissions:
   actions: read
 
 jobs:
-  apply_live_dev:
+  validate:
     runs-on: ubuntu-latest
-
-    # IMPORTANT: only require approval when actually applying
-    environment: ${{ inputs.dry_run && '' || 'live-apply' }}
-
-    concurrency:
-      group: apply-live-dev-${{ github.repository }}-${{ inputs.issue }}
-      cancel-in-progress: true
-
+    outputs:
+      digest: ${{ steps.validate.outputs.digest }}
     steps:
       - name: Checkout base branch
         uses: actions/checkout@v4
@@ -58,7 +52,6 @@ jobs:
           rm -rf _live_dev_artifact _live_dev_artifact_norm output
           mkdir -p output _live_dev_artifact
 
-          # download artifact from another workflow run
           gh run download "${RUN_ID}" \
             --repo "${OWNER}/${REPO}" \
             --name "live-dev" \
@@ -67,17 +60,17 @@ jobs:
           echo "Downloaded to _live_dev_artifact"
           ls -la _live_dev_artifact
 
-      - name: Validate + normalize artifact contents
+      - name: Validate + normalize artifact contents + write digest
+        id: validate
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
-
-          echo "Listing artifact dir:"
-          ls -la _live_dev_artifact || true
+          export LC_ALL=C
 
           mkdir -p _live_dev_artifact_norm/.ai/dev
+          mkdir -p output
 
           want="issue_${ISSUE}.md"
           found="$(find _live_dev_artifact -type f -name "${want}" | head -n 1 || true)"
@@ -96,14 +89,13 @@ jobs:
           if [ -n "${res}" ]; then cp -f "${res}" "_live_dev_artifact_norm/response.json"; fi
 
           echo "Normalized files:"
-          find _live_dev_artifact_norm -type f -maxdepth 6 -print
+          find _live_dev_artifact_norm -maxdepth 6 -type f -print
 
           digest_inputs=""
           [ -f "_live_dev_artifact_norm/.ai/dev/${want}" ] && digest_inputs="${digest_inputs} _live_dev_artifact_norm/.ai/dev/${want}"
           [ -f "_live_dev_artifact_norm/request.json" ] && digest_inputs="${digest_inputs} _live_dev_artifact_norm/request.json"
           [ -f "_live_dev_artifact_norm/response.json" ] && digest_inputs="${digest_inputs} _live_dev_artifact_norm/response.json"
 
-          # defensive: ensure we have at least the md file
           if [ -z "${digest_inputs}" ]; then
             echo "ERROR: digest_inputs empty (should not happen)" >&2
             exit 12
@@ -113,6 +105,16 @@ jobs:
           echo "${digest}" > output/apply_digest.txt
           echo "apply_digest: ${digest}"
 
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload normalized artifact for apply job
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-ready
+          path: |
+            _live_dev_artifact_norm
+            output/apply_digest.txt
+
       - name: Stop after validation (dry_run=true)
         if: ${{ inputs.dry_run == true }}
         shell: bash
@@ -121,27 +123,64 @@ jobs:
           echo "dry_run=true -> stopping after validation"
           exit 0
 
+  apply:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: ${{ inputs.dry_run == false }}
+
+    environment:
+      name: live-apply
+
+    concurrency:
+      group: apply-live-dev-${{ github.repository }}-${{ inputs.issue }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Download normalized artifact from validate job
+        uses: actions/download-artifact@v4
+        with:
+          name: apply-ready
+          path: .
+
       - name: Apply artifact into repo working tree
-        if: ${{ inputs.dry_run == false }}
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
+
+          test -f "output/apply_digest.txt"
+
           mkdir -p .ai/dev
+
+          test -f "_live_dev_artifact_norm/.ai/dev/issue_${ISSUE}.md"
           cp -f "_live_dev_artifact_norm/.ai/dev/issue_${ISSUE}.md" ".ai/dev/issue_${ISSUE}.md"
 
           # Optional trace files:
-          if [ -f "_live_dev_artifact_norm/request.json" ]; then cp -f "_live_dev_artifact_norm/request.json" ".ai/dev/request_${ISSUE}.json"; fi
-          if [ -f "_live_dev_artifact_norm/response.json" ]; then cp -f "_live_dev_artifact_norm/response.json" ".ai/dev/response_${ISSUE}.json"; fi
-
-          mkdir -p output
-          test -f output/apply_digest.txt
+          if [ -f "_live_dev_artifact_norm/request.json" ]; then
+            cp -f "_live_dev_artifact_norm/request.json" ".ai/dev/request_${ISSUE}.json"
+          fi
+          if [ -f "_live_dev_artifact_norm/response.json" ]; then
+            cp -f "_live_dev_artifact_norm/response.json" ".ai/dev/response_${ISSUE}.json"
+          fi
 
           git status --porcelain
 
       - name: Create branch + commit + push
-        if: ${{ inputs.dry_run == false }}
+        id: push
         shell: bash
         env:
           RUN_ID: ${{ inputs.run_id }}
@@ -152,9 +191,11 @@ jobs:
           BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
           git checkout -B "${BR}"
 
-          git add .ai/dev output || true
+          git add .ai/dev output
+
           if git diff --cached --quiet; then
             echo "No changes to commit. Exiting."
+            echo "branch=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -164,8 +205,11 @@ jobs:
           git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}"
           git push -f origin "${BR}"
 
-      - name: Open PR
-        if: ${{ inputs.dry_run == false }}
+          echo "branch=${BR}" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR (or find existing)
+        id: pr
+        if: ${{ steps.push.outputs.branch != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -174,15 +218,20 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           ISSUE: ${{ inputs.issue }}
           BASE: ${{ inputs.base_branch }}
+          BR: ${{ steps.push.outputs.branch }}
         run: |
           set -euo pipefail
 
-          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}. Digest in output/apply_digest.txt."
-
-          payload="$(python3 -c "import json; print(json.dumps({'title': '${title}', 'head': '${BR}', 'base': '${BASE}', 'body': '${body}'}))")"
+          TITLE="ai-live: issue #${ISSUE} (run ${RUN_ID})"
+          BODY="Apply LIVE DEV artifact live-dev from AI Debug run ${RUN_ID}. Digest in output/apply_digest.txt."
           api="https://api.github.com/repos/${OWNER}/${REPO}/pulls"
+
+          payload="$(jq -nc \
+            --arg title "$TITLE" \
+            --arg head "$BR" \
+            --arg base "$BASE" \
+            --arg body "$BODY" \
+            '{title:$title, head:$head, base:$base, body:$body}')"
 
           resp="$(curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -191,17 +240,29 @@ jobs:
             --data-binary "${payload}" \
             "${api}")"
 
-          url="$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('html_url',''))" "${resp}")"
-          if [ -z "${url}" ]; then
-            echo "ERROR: PR create failed. Response:" >&2
-            echo "${resp}" >&2
+          url="$(echo "$resp" | jq -r '.html_url // empty')"
+
+          # If create failed (often because PR already exists), fetch by head branch
+          if [ -z "$url" ]; then
+            prs_api="https://api.github.com/repos/${OWNER}/${REPO}/pulls?head=${OWNER}:${BR}&state=open"
+            prs="$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${prs_api}")"
+            url="$(echo "$prs" | jq -r '.[0].html_url // empty')"
+          fi
+
+          if [ -z "$url" ]; then
+            echo "ERROR: PR create/find failed. Response:" >&2
+            echo "$resp" >&2
             exit 20
           fi
 
-          echo "Opened PR: ${url}"
+          echo "Opened/Found PR: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Comment back to issue with PR link
-        if: ${{ inputs.dry_run == false }}
+        if: ${{ steps.pr.outputs.url != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -209,17 +270,13 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
+          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
           set -euo pipefail
 
-          head="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          prs_api="https://api.github.com/repos/${OWNER}/${REPO}/pulls?head=${OWNER}:${head}&state=open"
-          prs="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${prs_api}")"
-          pr_url="$(python3 -c "import json,sys; a=json.loads(sys.argv[1]); print((a[0].get('html_url','') if a else ''))" "${prs}")"
-
-          msg="Created PR for LIVE DEV apply: ${pr_url} (run_id=${RUN_ID})"
+          msg="Created PR for LIVE DEV apply: ${PR_URL} (run_id=${RUN_ID})"
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE}/comments"
-          payload="$(python3 -c "import json; print(json.dumps({'body': '${msg}'}))")"
+          payload="$(jq -nc --arg body "$msg" '{body:$body}')"
 
           curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
