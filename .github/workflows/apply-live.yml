@@ -65,7 +65,7 @@ jobs:
             --dir "_live_dev_artifact"
 
           echo "Downloaded artifact tree:"
-          find _live_dev_artifact -maxdepth 6 -type f -print
+          find _live_dev_artifact -maxdepth 8 -type f -print
 
       - name: Validate + normalize artifact contents
         shell: bash
@@ -80,7 +80,7 @@ jobs:
           if [ -z "${found}" ]; then
             echo "ERROR: missing ${want} anywhere in artifact" >&2
             echo "Tree:" >&2
-            find _live_dev_artifact -maxdepth 8 -type f -print >&2 || true
+            find _live_dev_artifact -maxdepth 10 -type f -print >&2 || true
             exit 11
           fi
 
@@ -92,7 +92,7 @@ jobs:
           if [ -n "${res}" ]; then cp -f "${res}" "_apply_ready/response.json"; fi
 
           echo "Normalized tree:"
-          find _apply_ready -maxdepth 6 -type f -print
+          find _apply_ready -maxdepth 8 -type f -print
 
           test -f "_apply_ready/.ai/dev/${want}"
 
@@ -243,12 +243,7 @@ jobs:
 
           prs_api="https://api.github.com/repos/${OWNER}/${REPO}/pulls?head=${OWNER}:${BRANCH}&state=open"
           prs="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${prs_api}")"
-          existing_url="$(python3 - <<'PY'
-import json,sys
-a=json.loads(sys.stdin.read() or "[]")
-print((a[0].get("html_url","") if a else ""))
-PY
-<<< "${prs}")"
+          existing_url="$(printf '%s' "${prs}" | python3 -c "import json,sys; a=json.load(sys.stdin) if sys.stdin.readable() else []; print((a[0].get('html_url','') if a else ''))")"
 
           if [ -n "${existing_url}" ]; then
             echo "Reusing existing PR: ${existing_url}"
@@ -256,16 +251,7 @@ PY
             exit 0
           fi
 
-          payload="$(TITLE="${title}" HEAD="${BRANCH}" BASE="${BASE}" BODY="${body}" python3 - <<'PY'
-import json,os
-print(json.dumps({
-  "title": os.environ["TITLE"],
-  "head": os.environ["HEAD"],
-  "base": os.environ["BASE"],
-  "body": os.environ["BODY"],
-}))
-PY
-)"
+          payload="$(TITLE="${title}" HEAD="${BRANCH}" BASE="${BASE}" BODY="${body}" python3 -c "import json,os; print(json.dumps({'title':os.environ['TITLE'],'head':os.environ['HEAD'],'base':os.environ['BASE'],'body':os.environ['BODY']}))")"
 
           api="https://api.github.com/repos/${OWNER}/${REPO}/pulls"
           resp="$(curl -sS -X POST \
@@ -275,13 +261,7 @@ PY
             --data-binary "${payload}" \
             "${api}")"
 
-          url="$(python3 - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("html_url",""))
-PY
-<<< "${resp}")"
-
+          url="$(printf '%s' "${resp}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('html_url',''))")"
           if [ -z "${url}" ]; then
             echo "ERROR: PR create failed. Response:" >&2
             echo "${resp}" >&2
@@ -305,12 +285,7 @@ PY
 
           msg="Created PR for LIVE DEV apply: ${PR_URL} (run_id=${RUN_ID})"
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE}/comments"
-
-          payload="$(MSG="${msg}" python3 - <<'PY'
-import json,os
-print(json.dumps({"body": os.environ["MSG"]}))
-PY
-)"
+          payload="$(MSG="${msg}" python3 -c "import json,os; print(json.dumps({'body':os.environ['MSG']}))")"
 
           curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
