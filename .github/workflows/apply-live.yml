@@ -60,9 +60,9 @@ jobs:
             --dir "_live_dev_artifact"
 
           echo "Downloaded artifact tree:"
-          find _live_dev_artifact -maxdepth 6 -type f -print
+          find _live_dev_artifact -maxdepth 8 -type f -print
 
-      - name: Validate + normalize -> apply_ready/
+      - name: Normalize -> apply_ready/
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
@@ -76,7 +76,7 @@ jobs:
           if [ -z "${found}" ]; then
             echo "ERROR: missing ${want} anywhere in artifact" >&2
             echo "Tree dump:" >&2
-            find _live_dev_artifact -maxdepth 8 -type f -print >&2 || true
+            find _live_dev_artifact -maxdepth 10 -type f -print >&2 || true
             exit 11
           fi
 
@@ -87,10 +87,6 @@ jobs:
           if [ -n "${req}" ]; then cp -f "${req}" "apply_ready/request.json"; fi
           if [ -n "${res}" ]; then cp -f "${res}" "apply_ready/response.json"; fi
 
-          echo "apply_ready tree (before digest):"
-          find apply_ready -maxdepth 6 -type f -print
-
-          # Deterministic digest
           digest_inputs="apply_ready/.ai/dev/${want}"
           [ -f "apply_ready/request.json" ] && digest_inputs="${digest_inputs} apply_ready/request.json"
           [ -f "apply_ready/response.json" ] && digest_inputs="${digest_inputs} apply_ready/response.json"
@@ -99,8 +95,8 @@ jobs:
           echo "${digest}" > apply_ready/output/apply_digest.txt
           echo "apply_digest: ${digest}"
 
-          echo "apply_ready tree (final):"
-          find apply_ready -maxdepth 6 -type f -print
+          echo "apply_ready tree:"
+          find apply_ready -maxdepth 8 -type f -print
 
       - name: Upload apply-ready artifact
         uses: actions/upload-artifact@v4
@@ -122,8 +118,6 @@ jobs:
     needs: [validate]
     if: ${{ inputs.dry_run == false }}
     runs-on: ubuntu-latest
-
-    # require approval only when actually applying
     environment: live-apply
 
     steps:
@@ -133,7 +127,14 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Download apply-ready artifact from validate job
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Download apply-ready artifact
         uses: actions/download-artifact@v4
         with:
           name: apply-ready
@@ -143,8 +144,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "apply_ready tree:"
-          find apply_ready -maxdepth 6 -type f -print
+          find apply_ready -maxdepth 8 -type f -print
 
       - name: Apply artifact into repo working tree
         shell: bash
@@ -155,10 +155,10 @@ jobs:
 
           want="issue_${ISSUE}.md"
           src="apply_ready/.ai/dev/${want}"
+
           if [ ! -f "${src}" ]; then
             echo "ERROR: expected file missing: ${src}" >&2
-            echo "apply_ready tree dump:" >&2
-            find apply_ready -maxdepth 8 -type f -print >&2 || true
+            find apply_ready -maxdepth 10 -type f -print >&2 || true
             exit 31
           fi
 
@@ -167,11 +167,9 @@ jobs:
           cp -f "${src}" ".ai/dev/${want}"
           cp -f "apply_ready/output/apply_digest.txt" "output/apply_digest.txt"
 
-          # optional traces
           if [ -f "apply_ready/request.json" ]; then cp -f "apply_ready/request.json" ".ai/dev/request_${ISSUE}.json"; fi
           if [ -f "apply_ready/response.json" ]; then cp -f "apply_ready/response.json" ".ai/dev/response_${ISSUE}.json"; fi
 
-          echo "Git status:"
           git status --porcelain
 
       - name: Create branch + commit + push
@@ -186,9 +184,9 @@ jobs:
           git checkout -B "${BR}"
 
           git add .ai/dev output
-
           if git diff --cached --quiet; then
             echo "No changes to commit. Exiting."
+            echo "BRANCH=${BR}" >> "$GITHUB_ENV"
             exit 0
           fi
 
@@ -209,18 +207,19 @@ jobs:
           ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
           BASE: ${{ inputs.base_branch }}
+          BRANCH: ${{ env.BRANCH }}
         run: |
           set -euo pipefail
 
           head="${OWNER}:${BRANCH}"
           prs_api="https://api.github.com/repos/${OWNER}/${REPO}/pulls?head=${head}&state=open"
-          existing="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "${prs_api}")"
-          existing_url="$(python3 - <<'PY'
-import json,sys,os
-a=json.loads(sys.stdin.read() or "[]")
-print((a[0].get("html_url","") if a else ""))
-PY
-<<< "${existing}")"
+
+          existing="$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${prs_api}")"
+
+          existing_url="$(echo "${existing}" | jq -r '.[0].html_url // ""')"
 
           if [ -n "${existing_url}" ]; then
             echo "Reusing existing PR: ${existing_url}"
@@ -228,19 +227,16 @@ PY
             exit 0
           fi
 
-          export TITLE="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          export BODY="Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}. Digest in output/apply_digest.txt."
+          TITLE="ai-live: issue #${ISSUE} (run ${RUN_ID})"
+          BODY="Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}. Digest in output/apply_digest.txt."
 
-          payload="$(python3 - <<'PY'
-import json,os
-print(json.dumps({
-  "title": os.environ["TITLE"],
-  "head":  os.environ["BRANCH"],
-  "base":  os.environ["BASE"],
-  "body":  os.environ["BODY"],
-}))
-PY
-)"
+          payload="$(jq -n \
+            --arg title "${TITLE}" \
+            --arg head  "${BRANCH}" \
+            --arg base  "${BASE}" \
+            --arg body  "${BODY}" \
+            '{title:$title, head:$head, base:$base, body:$body}')"
+
           api="https://api.github.com/repos/${OWNER}/${REPO}/pulls"
           resp="$(curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -249,13 +245,7 @@ PY
             --data-binary "${payload}" \
             "${api}")"
 
-          url="$(python3 - <<'PY'
-import json,sys
-d=json.loads(sys.stdin.read() or "{}")
-print(d.get("html_url",""))
-PY
-<<< "${resp}")"
-
+          url="$(echo "${resp}" | jq -r '.html_url // ""')"
           if [ -z "${url}" ]; then
             echo "ERROR: PR create failed. Response:" >&2
             echo "${resp}" >&2
@@ -265,9 +255,6 @@ PY
           echo "Opened PR: ${url}"
           echo "PR_URL=${url}" >> "$GITHUB_ENV"
 
-        env:
-          BRANCH: ${{ env.BRANCH }}
-
       - name: Comment back to issue with PR link
         shell: bash
         env:
@@ -276,21 +263,17 @@ PY
           REPO: ${{ github.event.repository.name }}
           ISSUE: ${{ inputs.issue }}
           RUN_ID: ${{ inputs.run_id }}
+          PR_URL: ${{ env.PR_URL }}
         run: |
           set -euo pipefail
+
           msg="Created/updated PR for LIVE DEV apply: ${PR_URL} (run_id=${RUN_ID})"
+          payload="$(jq -n --arg body "${msg}" '{body:$body}')"
           api="https://api.github.com/repos/${OWNER}/${REPO}/issues/${ISSUE}/comments"
-          payload="$(python3 - <<'PY'
-import json,os
-print(json.dumps({"body": os.environ["MSG"]}))
-PY
-)"
+
           curl -sS -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
             --data-binary "${payload}" \
             "${api}" > /dev/null
-        env:
-          PR_URL: ${{ env.PR_URL }}
-          MSG: ${{ format('Created/updated PR for LIVE DEV apply: {0} (run_id={1})', env.PR_URL, inputs.run_id) }}
