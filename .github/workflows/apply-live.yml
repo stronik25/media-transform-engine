@@ -235,11 +235,8 @@ jobs:
           set -euo pipefail
 
           title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="$(cat <<EOF
-Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}.
-Digest: see output/apply_digest.txt.
-EOF
-)"
+         body="Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}. Digest: see output/apply_digest.txt."
+
 
           existing_url="$(gh pr list --head "${BRANCH}" --state open --json url -q '.[0].url' || true)"
           if [ -n "${existing_url}" ]; then
