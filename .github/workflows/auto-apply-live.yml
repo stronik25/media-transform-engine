@@ -1,0 +1,110 @@
+name: "AUTO: Apply LIVE DEV when AI Debug requests apply_live=true"
+
+on:
+  workflow_run:
+    workflows:
+      - "AI Debug (v5 gates; v4 deterministic default)"
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  auto_apply:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Download AI Debug artifacts (context + preflight)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          rm -rf _ai_debug_artifacts
+          mkdir -p _ai_debug_artifacts/context _ai_debug_artifacts/preflight
+
+          gh run download "${RUN_ID}" \
+            --repo "${OWNER}/${REPO}" \
+            --name "ai-debug-context" \
+            --dir "_ai_debug_artifacts/context"
+
+          gh run download "${RUN_ID}" \
+            --repo "${OWNER}/${REPO}" \
+            --name "preflight-out" \
+            --dir "_ai_debug_artifacts/preflight" || true
+
+          echo "Artifacts downloaded."
+          find _ai_debug_artifacts -type f -maxdepth 6 -print || true
+
+      - name: Decide if apply_live was requested
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1) issue number from context/issue.json
+          ISSUE_JSON="$(find _ai_debug_artifacts/context -type f -name issue.json | head -n 1 || true)"
+          if [ -z "$ISSUE_JSON" ]; then
+            echo "ERROR: issue.json not found in ai-debug-context artifact" >&2
+            exit 21
+          fi
+
+          ISSUE="$(jq -r '.number // empty' "$ISSUE_JSON")"
+          if [ -z "$ISSUE" ] || ! echo "$ISSUE" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: could not parse issue number from $ISSUE_JSON" >&2
+            exit 22
+          fi
+
+          # 2) apply_live flag from preflight/summary.txt (best-effort)
+          SUMMARY_TXT="$(find _ai_debug_artifacts/preflight -type f -name summary.txt | head -n 1 || true)"
+          APPLY="false"
+          if [ -n "$SUMMARY_TXT" ]; then
+            # your preflight writes apply_live_input_norm=true/false
+            if grep -Eq '^apply_live_input_norm=true$' "$SUMMARY_TXT"; then
+              APPLY="true"
+            fi
+          fi
+
+          echo "issue=${ISSUE}" >> "$GITHUB_OUTPUT"
+          echo "apply=${APPLY}" >> "$GITHUB_OUTPUT"
+
+          echo "Decision: issue=$ISSUE apply_live=$APPLY"
+
+      - name: Stop if apply_live is not requested
+        if: ${{ steps.decide.outputs.apply != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "apply_live not requested -> skipping (green)."
+
+      - name: Trigger Apply LIVE DEV workflow
+        if: ${{ steps.decide.outputs.apply == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ISSUE: ${{ steps.decide.outputs.issue }}
+        run: |
+          set -euo pipefail
+
+          # Trigger apply-live.yml via workflow_dispatch
+          gh workflow run "apply-live.yml" \
+            --ref "main" \
+            -f run_id="${RUN_ID}" \
+            -f issue="${ISSUE}" \
+            -f base_branch="main" \
+            -f dry_run="false"
+
+          echo "Triggered apply-live.yml for run_id=$RUN_ID issue=$ISSUE"
