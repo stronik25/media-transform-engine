@@ -32,8 +32,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     outputs:
-      digest: ${{ steps.digest.outputs.digest }}
-      has_issue_file: ${{ steps.digest.outputs.has_issue_file }}
+      digest: ${{ steps.normalize.outputs.digest }}
 
     steps:
       - name: Checkout base branch
@@ -42,7 +41,7 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Download artifact "live-dev" from AI Debug run (via gh)
+      - name: Download artifact "live-dev" from AI Debug run
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,86 +50,86 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          rm -rf _live_dev_artifact _live_dev_artifact_norm output
-          mkdir -p output _live_dev_artifact
+          rm -rf _live_dev_raw _live_dev_norm output
+          mkdir -p _live_dev_raw _live_dev_norm/.ai/dev output
 
           gh run download "${RUN_ID}" \
             --repo "${OWNER}/${REPO}" \
             --name "live-dev" \
-            --dir "_live_dev_artifact"
+            --dir "_live_dev_raw"
 
-          echo "Downloaded _live_dev_artifact tree:"
-          find _live_dev_artifact -maxdepth 6 -type f -print || true
+          echo "Downloaded live-dev:"
+          find _live_dev_raw -maxdepth 3 -type f -print
 
-      - name: Validate + normalize artifact contents + write digest
-        id: digest
+      - name: Normalize artifact + write digest
+        id: normalize
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
-          mkdir -p _live_dev_artifact_norm/.ai/dev
+          WANT="issue_${ISSUE}.md"
 
-          want="issue_${ISSUE}.md"
-          found="$(find _live_dev_artifact -type f -name "${want}" | head -n 1 || true)"
-          if [ -z "${found}" ]; then
-            echo "ERROR: missing ${want} anywhere in live-dev artifact" >&2
-            echo "Artifact file list:" >&2
-            find _live_dev_artifact -maxdepth 10 -type f -print >&2 || true
-            echo "has_issue_file=false" >> "$GITHUB_OUTPUT"
+          SRC_MD="$(find _live_dev_raw -type f -name "${WANT}" | head -n 1 || true)"
+          if [ -z "$SRC_MD" ]; then
+            echo "ERROR: ${WANT} not found in live-dev artifact" >&2
+            echo "Files present:" >&2
+            find _live_dev_raw -type f -print >&2
             exit 11
           fi
 
-          cp -f "${found}" "_live_dev_artifact_norm/.ai/dev/${want}"
+          # normalize location
+          cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          req="$(find _live_dev_artifact -type f -name "request.json"  | head -n 1 || true)"
-          res="$(find _live_dev_artifact -type f -name "response.json" | head -n 1 || true)"
-          dig="$(find _live_dev_artifact -type f -name "apply_digest.txt" | head -n 1 || true)"
-
-          if [ -n "${req}" ]; then cp -f "${req}" "_live_dev_artifact_norm/request.json"; fi
-          if [ -n "${res}" ]; then cp -f "${res}" "_live_dev_artifact_norm/response.json"; fi
-          if [ -n "${dig}" ]; then cp -f "${dig}" "_live_dev_artifact_norm/apply_digest_live.txt"; fi
+          # optional context
+          for f in request.json response.json apply_digest.txt; do
+            SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
+            if [ -n "$SRC" ]; then
+              cp -f "$SRC" "_live_dev_norm/$f"
+            fi
+          done
 
           echo "Normalized tree:"
-          find _live_dev_artifact_norm -maxdepth 10 -type f -print
+          find _live_dev_norm -type f -print
 
-          digest_inputs="_live_dev_artifact_norm/.ai/dev/${want}"
-          [ -f "_live_dev_artifact_norm/request.json" ]  && digest_inputs="${digest_inputs} _live_dev_artifact_norm/request.json"
-          [ -f "_live_dev_artifact_norm/response.json" ] && digest_inputs="${digest_inputs} _live_dev_artifact_norm/response.json"
+          # digest
+          MANIFEST="$(mktemp)"
+          cleanup() { rm -f "$MANIFEST"; }
+          trap cleanup EXIT
 
-          digest="$(sha256sum ${digest_inputs} | sha256sum | awk '{print $1}')"
-          echo "${digest}" > output/apply_digest.txt
-          echo "apply_digest: ${digest}"
+          for f in "_live_dev_norm/.ai/dev/${WANT}" \
+                   "_live_dev_norm/request.json" \
+                   "_live_dev_norm/response.json"; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> "$MANIFEST"
+          done
 
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-          echo "has_issue_file=true" >> "$GITHUB_OUTPUT"
+          DIGEST="$(sha256sum "$MANIFEST" | awk '{print $1}')"
+          echo "sha256:${DIGEST}" > output/apply_digest.txt
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload apply-ready artifact (normalized)
+      - name: Upload apply-ready artifact
         uses: actions/upload-artifact@v4
         with:
           name: apply-ready
           path: |
-            _live_dev_artifact_norm
+            _live_dev_norm
             output/apply_digest.txt
-          if-no-files-found: error
           retention-days: 7
 
   dry_run_done:
     if: ${{ inputs.dry_run == true }}
-    needs: [validate]
+    needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Stop after validation (dry_run=true)
-        shell: bash
+      - name: Dry run complete
         run: |
-          set -euo pipefail
-          echo "dry_run=true -> validation OK, stopping."
-          exit 0
+          echo "dry_run=true → validation OK"
 
   apply:
     if: ${{ inputs.dry_run == false }}
-    needs: [validate]
+    needs: validate
     runs-on: ubuntu-latest
     environment: live-apply
 
@@ -141,47 +140,26 @@ jobs:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Download apply-ready artifact
+      - name: Download apply-ready
         uses: actions/download-artifact@v4
         with:
           name: apply-ready
           path: apply_ready
 
-      - name: Show apply-ready tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "apply_ready tree:"
-          find apply_ready -maxdepth 10 -type f -print
-
-      - name: Apply artifact into repo working tree
+      - name: Apply artifact into repo
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
-          want="apply_ready/_live_dev_artifact_norm/.ai/dev/issue_${ISSUE}.md"
-          if [ ! -f "${want}" ]; then
-            echo "ERROR: expected file missing: ${want}" >&2
-            echo "apply_ready files:" >&2
-            find apply_ready -maxdepth 10 -type f -print >&2 || true
-            exit 31
-          fi
+          SRC="apply_ready/_live_dev_norm/.ai/dev/issue_${ISSUE}.md"
+          test -f "$SRC"
 
           mkdir -p .ai/dev output
-          cp -f "${want}" ".ai/dev/issue_${ISSUE}.md"
-
-          if [ -f "apply_ready/_live_dev_artifact_norm/request.json" ]; then
-            cp -f "apply_ready/_live_dev_artifact_norm/request.json" ".ai/dev/request_${ISSUE}.json"
-          fi
-          if [ -f "apply_ready/_live_dev_artifact_norm/response.json" ]; then
-            cp -f "apply_ready/_live_dev_artifact_norm/response.json" ".ai/dev/response_${ISSUE}.json"
-          fi
-
+          cp -f "$SRC" ".ai/dev/issue_${ISSUE}.md"
           cp -f "apply_ready/output/apply_digest.txt" "output/apply_digest.txt"
 
-          echo "Working tree changes:"
           git status -sb
 
       - name: Create branch + commit + PR
@@ -198,12 +176,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "$BR"
-
           git add .ai/dev output/apply_digest.txt
           git commit -m "apply live-dev: issue #${ISSUE}" || true
           git push -u origin "$BR" --force
 
           TITLE="apply live-dev: issue #${ISSUE}"
-          BODY="Applied live-dev artifact from run_id=${{ inputs.run_id }}.\n\nDigest: $(cat output/apply_digest.txt)"
+          BODY="Applied live-dev artifact from run_id=${{ inputs.run_id }}\n\n$(cat output/apply_digest.txt)"
           gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
