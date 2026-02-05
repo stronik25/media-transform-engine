@@ -13,7 +13,7 @@ on:
         type: boolean
         default: false
       apply_live:
-        description: "Apply LIVE DEV output into repo (creates branch+PR). Default false."
+        description: "Apply LIVE DEV output into repo (creates branch+PR). Default false. (Not used here; use Apply workflow)"
         required: true
         type: boolean
         default: false
@@ -97,16 +97,13 @@ jobs:
           MAX_OUT: ${{ inputs.live_max_output_tokens }}
         run: |
           set -euo pipefail
-
           die() { echo "ERROR: $1" >&2; exit 2; }
 
-          # float > 0
           if ! printf "%s" "${MAX_USD}" | tr -d '[:space:]' | grep -Eq '^[0-9]+([.][0-9]+)?$'; then
             die "live_max_usd must be a number, got: ${MAX_USD}"
           fi
           python3 -c "import os,sys; v=float(os.environ['MAX_USD'].strip()); sys.exit(0 if v>0 else 1)" || die "live_max_usd must be > 0, got: ${MAX_USD}"
 
-          # int > 0
           if ! printf "%s" "${MAX_IN}" | tr -d '[:space:]' | grep -Eq '^[0-9]+$'; then
             die "live_max_input_tokens must be an int, got: ${MAX_IN}"
           fi
@@ -193,12 +190,10 @@ jobs:
                 exit 3
               fi
 
-              # Build validator script without heredoc
               PY="${OUTPUT_DIR}/tmp/validate_openai_config.py"
               : > "$PY"
               printf "%s\n" "import json,os,sys" >> "$PY"
-              printf "%s\n" "def die(m,c=4):" >> "$PY"
-              printf "%s\n" "  print(m,file=sys.stderr); sys.exit(c)" >> "$PY"
+              printf "%s\n" "def die(m,c=4): print(m,file=sys.stderr); sys.exit(c)" >> "$PY"
               printf "%s\n" "od=os.environ['OUTPUT_DIR']" >> "$PY"
               printf "%s\n" "cfg_path=os.path.join(od,'preflight','openai.config.json')" >> "$PY"
               printf "%s\n" "cfg=json.load(open(cfg_path,'r',encoding='utf-8'))" >> "$PY"
@@ -221,15 +216,14 @@ jobs:
               printf "%s\n" "  pout=float(roles[r]['price_out_per_1k'])" >> "$PY"
               printf "%s\n" "  est += (max_in/1000.0)*pin + (max_out/1000.0)*pout" >> "$PY"
               printf "%s\n" "rp=os.path.join(od,'preflight','report.txt')" >> "$PY"
-              printf "%s\n" "lines=[" >> "$PY"
+              printf "%s\n" "open(rp,'w',encoding='utf-8').write('\\n'.join([" >> "$PY"
               printf "%s\n" "  'run_live_requested=true'," >> "$PY"
               printf "%s\n" "  'live_enabled_var=true'," >> "$PY"
               printf "%s\n" "  f'max_usd={max_usd}'," >> "$PY"
               printf "%s\n" "  f'max_input_tokens={max_in}'," >> "$PY"
               printf "%s\n" "  f'max_output_tokens_per_call={max_out}'," >> "$PY"
               printf "%s\n" "  f'estimated_usd_conservative={est:.6f}'," >> "$PY"
-              printf "%s\n" "]" >> "$PY"
-              printf "%s\n" "open(rp,'w',encoding='utf-8').write('\\n'.join(lines)+'\\n')" >> "$PY"
+              printf "%s\n" "])+'\\n')" >> "$PY"
               printf "%s\n" "if est>max_usd:" >> "$PY"
               printf "%s\n" "  msg=f'Estimated USD {est:.6f} exceeds cap {max_usd:.6f}'" >> "$PY"
               printf "%s\n" "  if fail_on_cap: die(msg,5)" >> "$PY"
@@ -264,6 +258,7 @@ jobs:
             echo "run_live_effective=${EFFECTIVE}"
             echo "reason=${REASON}"
             echo "note=${NOTE}"
+            echo "hint_apply: use Apply workflow with run_id=${GITHUB_RUN_ID}"
           } >> "${OUTPUT_DIR}/preflight/summary.txt"
 
       - name: "Upload context artifact"
@@ -294,7 +289,7 @@ jobs:
           name: ai-debug-context
           path: output/context
 
-      - name: "Generate deterministic patch from issue.json"
+      - name: "Generate deterministic summary .ai/dev/issue_<N>.md"
         shell: bash
         run: |
           set -euo pipefail
@@ -337,7 +332,7 @@ jobs:
           set -euo pipefail
           BR="${{ needs.preflight.outputs.branch_name }}"
           TITLE="ai-debug: issue #${{ needs.preflight.outputs.issue_num }}"
-          BODY="Deterministic patch generated from issue.json (no LLM)."
+          BODY="Deterministic summary generated from issue.json (no LLM)."
           gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
 
@@ -363,13 +358,16 @@ jobs:
           set -euo pipefail
           ls -la qa_artifacts
           test "$(find qa_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
-          echo "QA OK: issue summary exists"
+          echo "QA OK: deterministic issue summary exists"
 
   arch_live:
     runs-on: ubuntu-latest
     needs: preflight
     if: ${{ needs.preflight.outputs.run_live_effective == 'true' }}
     steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
       - name: "Download context artifact"
         uses: actions/download-artifact@v4
         with:
@@ -413,19 +411,14 @@ jobs:
           printf "%s\n" ")" >> "$PY"
           printf "%s\n" "payload={'model':model,'input':[{'role':'user','content':[{'type':'input_text','text':prompt}]}],'max_output_tokens':max_out}" >> "$PY"
           printf "%s\n" "json.dump(payload,open('output/live/arch/request.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)" >> "$PY"
-
           python3 "$PY"
 
-          curl --retry 5 \
-               --retry-all-errors \
-               --retry-delay 2 \
-               --connect-timeout 15 \
-               --max-time 120 \
-               -sS https://api.openai.com/v1/responses \
-               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-               -H "Content-Type: application/json" \
-               -d @output/live/arch/request.json \
-               > output/live/arch/response.json
+          curl --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            -sS https://api.openai.com/v1/responses \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @output/live/arch/request.json \
+            > output/live/arch/response.json
 
           test -s output/live/arch/response.json
 
@@ -440,6 +433,12 @@ jobs:
     needs: [preflight, arch_live]
     if: ${{ needs.preflight.outputs.run_live_effective == 'true' }}
     steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Install jq"
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+
       - name: "Download context artifact"
         uses: actions/download-artifact@v4
         with:
@@ -458,12 +457,11 @@ jobs:
           name: live-arch
           path: output/live/arch
 
-      - name: "DEV (OpenAI) -> issue_<N>.md"
+      - name: "DEV (OpenAI) -> response.json"
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           LIVE_MAX_OUT: ${{ inputs.live_max_output_tokens }}
-          ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
         run: |
           set -euo pipefail
           test -n "${OPENAI_API_KEY}"
@@ -494,86 +492,95 @@ jobs:
           printf "%s\n" ")" >> "$PY"
           printf "%s\n" "payload={'model':model,'input':[{'role':'user','content':[{'type':'input_text','text':prompt}]}],'max_output_tokens':max_out}" >> "$PY"
           printf "%s\n" "json.dump(payload,open('output/live/dev/request.json','w',encoding='utf-8'),ensure_ascii=True,indent=2)" >> "$PY"
-
           python3 "$PY"
 
-          curl --retry 5 \
-               --retry-all-errors \
-               --retry-delay 2 \
-               --connect-timeout 15 \
-               --max-time 120 \
-               -sS https://api.openai.com/v1/responses \
-               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-               -H "Content-Type: application/json" \
-               -d @output/live/dev/request.json \
-               > output/live/dev/response.json
+          curl --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 120 \
+            -sS https://api.openai.com/v1/responses \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @output/live/dev/request.json \
+            > output/live/dev/response.json
 
           test -s output/live/dev/response.json
 
-          PY2="output/tmp/extract_dev_md.py"
-          : > "$PY2"
-          printf "%s\n" "import json,os" >> "$PY2"
-          printf "%s\n" "issue_num=os.environ['ISSUE_NUM']" >> "$PY2"
-          printf "%s\n" "resp=json.load(open('output/live/dev/response.json','r',encoding='utf-8'))" >> "$PY2"
-          printf "%s\n" "md=None" >> "$PY2"
-          printf "%s\n" "out=resp.get('output')" >> "$PY2"
-          printf "%s\n" "if isinstance(out,list):" >> "$PY2"
-          printf "%s\n" "  texts=[]" >> "$PY2"
-          printf "%s\n" "  for item in out:" >> "$PY2"
-          printf "%s\n" "    content=item.get('content') if isinstance(item,dict) else None" >> "$PY2"
-          printf "%s\n" "    if isinstance(content,list):" >> "$PY2"
-          printf "%s\n" "      for c in content:" >> "$PY2"
-          printf "%s\n" "        if isinstance(c,dict) and c.get('type') in ('output_text','text') and isinstance(c.get('text'),str):" >> "$PY2"
-          printf "%s\n" "          texts.append(c['text'])" >> "$PY2"
-          printf "%s\n" "  if texts:" >> "$PY2"
-          printf "%s\n" "    md='\\n'.join(texts).strip()" >> "$PY2"
-          printf "%s\n" "if not md:" >> "$PY2"
-          printf "%s\n" "  md=json.dumps(resp,ensure_ascii=False,indent=2)" >> "$PY2"
-          printf "%s\n" "p=f'output/live/dev/issue_{issue_num}.md'" >> "$PY2"
-          printf "%s\n" "open(p,'w',encoding='utf-8').write(md+'\\n')" >> "$PY2"
-          printf "%s\n" "print('Wrote',p)" >> "$PY2"
+      - name: "Materialize DEV markdown into .ai/dev/issue_<N>.md (CONTRACT)"
+        shell: bash
+        env:
+          ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
+        run: |
+          set -euo pipefail
 
-          python3 "$PY2"
+          mkdir -p .ai/dev output/tmp output/live/dev
+          OUT=".ai/dev/issue_${ISSUE_NUM}.md"
+
+          PY="output/tmp/extract_dev_md.py"
+          : > "$PY"
+          printf "%s\n" "import json,sys,os" >> "$PY"
+          printf "%s\n" "issue=os.environ['ISSUE_NUM']" >> "$PY"
+          printf "%s\n" "resp=json.load(open('output/live/dev/response.json','r',encoding='utf-8'))" >> "$PY"
+          printf "%s\n" "texts=[]" >> "$PY"
+          printf "%s\n" "out=resp.get('output')" >> "$PY"
+          printf "%s\n" "if isinstance(out,list):" >> "$PY"
+          printf "%s\n" "  for item in out:" >> "$PY"
+          printf "%s\n" "    if isinstance(item,dict):" >> "$PY"
+          printf "%s\n" "      content=item.get('content')" >> "$PY"
+          printf "%s\n" "      if isinstance(content,list):" >> "$PY"
+          printf "%s\n" "        for c in content:" >> "$PY"
+          printf "%s\n" "          if isinstance(c,dict) and isinstance(c.get('text'),str):" >> "$PY"
+          printf "%s\n" "            t=c.get('type')" >> "$PY"
+          printf "%s\n" "            if t in ('output_text','text'):" >> "$PY"
+          printf "%s\n" "              texts.append(c['text'])" >> "$PY"
+          printf "%s\n" "md='\\n'.join(texts).strip() if texts else ''" >> "$PY"
+          printf "%s\n" "if not md:" >> "$PY"
+          printf "%s\n" "  md=json.dumps(resp,ensure_ascii=False,indent=2)" >> "$PY"
+          printf "%s\n" "open('.ai/dev/issue_%s.md'%issue,'w',encoding='utf-8').write(md+'\\n')" >> "$PY"
+          printf "%s\n" "print('Wrote .ai/dev/issue_%s.md'%issue)" >> "$PY"
+
+          python3 "$PY"
+
+          test -f "$OUT"
+          test -s "$OUT"
+
+          # Also keep a copy next to request/response for convenience (optional)
+          cp -f "$OUT" "output/live/dev/issue_${ISSUE_NUM}.md"
 
       - name: "Write apply_digest.txt (contract v1)"
         shell: bash
+        env:
+          ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
         run: |
           set -euo pipefail
           export LC_ALL=C
 
-          cd output/live/dev
+          test -f ".ai/dev/issue_${ISSUE_NUM}.md"
+          test -f "output/live/dev/request.json"
+          test -f "output/live/dev/response.json"
 
-          # Required files (contract)
-          test -f request.json
-          test -f response.json
-          test "$(ls -1 issue_*.md 2>/dev/null | wc -l)" -ge 1
-
-          MANIFEST_FILE="$(mktemp)"
-          cleanup() { rm -f "${MANIFEST_FILE}"; }
+          MANIFEST="$(mktemp)"
+          cleanup() { rm -f "$MANIFEST"; }
           trap cleanup EXIT
 
-          # Order: issue_*.md (sorted) + request.json + response.json
-          for f in $(ls -1 issue_*.md | sort); do
+          for f in ".ai/dev/issue_${ISSUE_NUM}.md" "output/live/dev/request.json" "output/live/dev/response.json"; do
             H="$(sha256sum "$f" | awk '{print $1}')"
-            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
+            printf "%s  %s\n" "$H" "$f" >> "$MANIFEST"
           done
 
-          for f in request.json response.json; do
-            H="$(sha256sum "$f" | awk '{print $1}')"
-            printf "%s  %s\n" "$H" "$f" >> "${MANIFEST_FILE}"
-          done
-
-          FINAL="$(sha256sum "${MANIFEST_FILE}" | awk '{print $1}')"
-          printf "sha256:%s\n" "${FINAL}" > apply_digest.txt
-
-          test -s apply_digest.txt
+          FINAL="$(sha256sum "$MANIFEST" | awk '{print $1}')"
+          printf "sha256:%s\n" "$FINAL" > "output/live/dev/apply_digest.txt"
+          test -s "output/live/dev/apply_digest.txt"
           echo "OK: wrote apply_digest.txt sha256:${FINAL}"
 
-      - name: "Upload LIVE DEV artifact"
+      - name: "Upload LIVE DEV artifact (must include .ai/dev/issue_<N>.md)"
         uses: actions/upload-artifact@v4
         with:
           name: live-dev
-          path: output/live/dev
+          path: |
+            .ai/dev
+            output/live/dev/request.json
+            output/live/dev/response.json
+            output/live/dev/apply_digest.txt
+          if-no-files-found: error
+          retention-days: 7
 
   qa_live:
     runs-on: ubuntu-latest
@@ -590,23 +597,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ls -la qa_live_artifacts
-          test "$(find qa_live_artifacts -maxdepth 1 -type f -name 'issue_*.md' | wc -l)" -ge 1
-          echo "QA LIVE OK: issue markdown exists"
+          echo "qa_live_artifacts tree:"
+          find qa_live_artifacts -maxdepth 6 -type f -print
+
+          test "$(find qa_live_artifacts -type f -path '*/.ai/dev/issue_*.md' | wc -l)" -ge 1
+          echo "QA LIVE OK: .ai/dev/issue_<N>.md exists in artifact"
 
       - name: "Upload LIVE QA artifact"
         uses: actions/upload-artifact@v4
         with:
           name: live-qa
           path: qa_live_artifacts
-
-  apply_live_dev:
-    runs-on: ubuntu-latest
-    needs: [preflight, qa_live]
-    if: ${{ needs.preflight.outputs.run_live_effective == 'true' && needs.preflight.outputs.apply_live_requested == 'true' }}
-    steps:
-      - name: "Apply is gated"
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "apply_live_dev runs only when apply_live=true. Use apply-live.yml manual apply by run_id for production."
