@@ -87,7 +87,7 @@ jobs:
             fi
           done
 
-          echo "Normalized tree:"
+          echo "Normalized tree (including hidden):"
           find _live_dev_norm -type f -print
 
           MANIFEST="$(mktemp)"
@@ -110,6 +110,7 @@ jobs:
           path: |
             _live_dev_norm
             output/apply_digest.txt
+          include-hidden-files: true
           retention-days: 7
 
   dry_run_done:
@@ -161,9 +162,12 @@ jobs:
             exit 31
           fi
 
+          DIG="$(find apply_ready -type f -name apply_digest.txt | head -n 1 || true)"
+          test -n "$DIG"
+
           mkdir -p .ai/dev output
           cp -f "$SRC" ".ai/dev/${WANT}"
-          cp -f "$(find apply_ready -name apply_digest.txt | head -n 1)" "output/apply_digest.txt"
+          cp -f "$DIG" "output/apply_digest.txt"
 
           git status -sb
 
