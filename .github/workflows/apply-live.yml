@@ -130,8 +130,7 @@ jobs:
     needs: [validate]
     runs-on: ubuntu-latest
 
-    # If your plan supports environment approvals, this will enforce it.
-    # If not supported, it will NOT provide UI approval gating.
+    # Requires GitHub Environments approval settings to show the UI gating.
     environment: live-apply
 
     steps:
@@ -181,81 +180,4 @@ jobs:
           cp -f "apply_ready/output/apply_digest.txt" "output/apply_digest.txt"
 
           echo "Working tree changes:"
-          git status --porcelain
-
-      - name: Create branch + commit + push (skip if no changes)
-        id: push
-        shell: bash
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-        run: |
-          set -euo pipefail
-
-          BR="ai-live/issue-${ISSUE}-run-${RUN_ID}"
-          git checkout -B "${BR}"
-
-          git add .ai/dev output || true
-          if git diff --cached --quiet; then
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
-            echo "branch=${BR}" >> "$GITHUB_OUTPUT"
-            echo "No changes vs base. Nothing to PR."
-            exit 0
-          fi
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git commit -m "apply-live: issue #${ISSUE} from run ${RUN_ID}"
-          git push -f origin "${BR}"
-
-          echo "no_changes=false" >> "$GITHUB_OUTPUT"
-          echo "branch=${BR}" >> "$GITHUB_OUTPUT"
-
-      - name: Open PR (or reuse existing) (skip if no changes)
-        if: ${{ steps.push.outputs.no_changes == 'false' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          ISSUE: ${{ inputs.issue }}
-          BASE: ${{ inputs.base_branch }}
-          BRANCH: ${{ steps.push.outputs.branch }}
-        run: |
-          set -euo pipefail
-
-          title="ai-live: issue #${ISSUE} (run ${RUN_ID})"
-          body="$(cat <<EOF
-Apply LIVE DEV artifact 'live-dev' from AI Debug run ${RUN_ID}.
-Digest: see output/apply_digest.txt.
-EOF
-)"
-
-          existing_url="$(gh pr list --head "${BRANCH}" --state open --json url -q '.[0].url' || true)"
-          if [ -n "${existing_url}" ]; then
-            echo "Reusing existing PR: ${existing_url}"
-            echo "pr_url=${existing_url}" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          url="$(gh pr create --head "${BRANCH}" --base "${BASE}" --title "${title}" --body "${body}")"
-          echo "Opened PR: ${url}"
-          echo "pr_url=${url}" >> "$GITHUB_ENV"
-
-      - name: Comment back to issue (always; even if no changes)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
-          BRANCH: ${{ steps.push.outputs.branch }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "${pr_url:-}" ]; then
-            msg="Created/updated PR for LIVE DEV apply: ${pr_url} (run_id=${RUN_ID})"
-          else
-            msg="LIVE DEV apply: no changes to apply (already up to date). run_id=${RUN_ID} (branch=${BRANCH})"
-          fi
-
-          gh issue comment "${ISSUE}" --body "${msg}"
+          git status -
