@@ -255,13 +255,38 @@ jobs:
           set -euo pipefail
           BR="ai-live/issue-${ISSUE}"
 
-          MERGED="$(gh pr view "$BR" --json merged -q .merged)"
-          if [ "$MERGED" = "true" ]; then
-            echo "PR already merged -> ok"
+          # If already merged -> stop (green)
+          MERGED_AT="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
+          if [ -n "${MERGED_AT}" ] && [ "${MERGED_AT}" != "null" ]; then
+            echo "PR already merged at ${MERGED_AT} -> ok"
             exit 0
           fi
 
-          echo "Enabling auto-merge for $BR ..."
+          echo "Enabling auto-merge (squash) for $BR ..."
+          set +e
           gh pr merge "$BR" --auto --squash --delete-branch
+          RC=$?
+          set -e
 
-          echo "OK: auto-merge enabled (will merge when requirements pass)"
+          if [ $RC -eq 0 ]; then
+            echo "OK: auto-merge enabled (will merge when requirements pass)"
+            exit 0
+          fi
+
+          # If the command failed, check whether auto-merge is already enabled.
+          AM_STATE="$(gh pr view "$BR" --json autoMergeRequest,mergedAt,state -q '.autoMergeRequest != null' || true)"
+          MERGED_AT2="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
+
+          if [ -n "${MERGED_AT2}" ] && [ "${MERGED_AT2}" != "null" ]; then
+            echo "PR got merged meanwhile -> ok"
+            exit 0
+          fi
+
+          if [ "$AM_STATE" = "true" ]; then
+            echo "Auto-merge already enabled -> ok"
+            exit 0
+          fi
+
+          echo "ERROR: failed to enable auto-merge (and it is not enabled)."
+          echo "Tip: open the PR page and check merge requirements / branch protection / permission."
+          exit 1
