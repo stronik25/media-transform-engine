@@ -93,12 +93,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh workflow run apply-live.yml \
+          # IMPORTANT: use correct workflow file name
+          gh workflow run apply-live-dev.yml \
             --repo "${OWNER}/${REPO}" \
             --ref "main" \
             -f run_id="${RUN_ID}" \
             -f issue="${ISSUE}" \
             -f base_branch="main" \
-            -f dry_run="false"
+            -f dry_run="false" \
+            -f qa_enabled="true" \
+            -f write_digest_history="true"
 
           echo "Apply LIVE DEV triggered automatically"
