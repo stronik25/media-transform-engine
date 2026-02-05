@@ -58,8 +58,8 @@ jobs:
             --name "live-dev" \
             --dir "_live_dev_raw"
 
-          echo "Downloaded live-dev:"
-          find _live_dev_raw -maxdepth 3 -type f -print
+          echo "Downloaded live-dev tree:"
+          find _live_dev_raw -type f -print
 
       - name: Normalize artifact + write digest
         id: normalize
@@ -74,15 +74,12 @@ jobs:
           SRC_MD="$(find _live_dev_raw -type f -name "${WANT}" | head -n 1 || true)"
           if [ -z "$SRC_MD" ]; then
             echo "ERROR: ${WANT} not found in live-dev artifact" >&2
-            echo "Files present:" >&2
             find _live_dev_raw -type f -print >&2
             exit 11
           fi
 
-          # normalize location
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          # optional context
           for f in request.json response.json apply_digest.txt; do
             SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
             if [ -n "$SRC" ]; then
@@ -93,16 +90,13 @@ jobs:
           echo "Normalized tree:"
           find _live_dev_norm -type f -print
 
-          # digest
           MANIFEST="$(mktemp)"
-          cleanup() { rm -f "$MANIFEST"; }
-          trap cleanup EXIT
+          trap 'rm -f "$MANIFEST"' EXIT
 
           for f in "_live_dev_norm/.ai/dev/${WANT}" \
                    "_live_dev_norm/request.json" \
                    "_live_dev_norm/response.json"; do
-            [ -f "$f" ] || continue
-            sha256sum "$f" >> "$MANIFEST"
+            [ -f "$f" ] && sha256sum "$f" >> "$MANIFEST"
           done
 
           DIGEST="$(sha256sum "$MANIFEST" | awk '{print $1}')"
@@ -123,9 +117,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Dry run complete
-        run: |
-          echo "dry_run=true → validation OK"
+      - run: echo "dry_run=true → validation OK"
 
   apply:
     if: ${{ inputs.dry_run == false }}
@@ -146,6 +138,13 @@ jobs:
           name: apply-ready
           path: apply_ready
 
+      - name: Show apply-ready tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "apply_ready tree:"
+          find apply_ready -type f -print
+
       - name: Apply artifact into repo
         shell: bash
         env:
@@ -153,12 +152,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          SRC="apply_ready/_live_dev_norm/.ai/dev/issue_${ISSUE}.md"
-          test -f "$SRC"
+          WANT="issue_${ISSUE}.md"
+          SRC="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
+
+          if [ -z "$SRC" ]; then
+            echo "ERROR: ${WANT} not found after normalization" >&2
+            find apply_ready -type f -print >&2
+            exit 31
+          fi
 
           mkdir -p .ai/dev output
-          cp -f "$SRC" ".ai/dev/issue_${ISSUE}.md"
-          cp -f "apply_ready/output/apply_digest.txt" "output/apply_digest.txt"
+          cp -f "$SRC" ".ai/dev/${WANT}"
+          cp -f "$(find apply_ready -name apply_digest.txt | head -n 1)" "output/apply_digest.txt"
 
           git status -sb
 
