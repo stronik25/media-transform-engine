@@ -153,7 +153,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Current digest from apply-ready (normalized output)
           CUR_DIG_FILE="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
           if [ -z "$CUR_DIG_FILE" ]; then
             echo "ERROR: apply_ready/output/apply_digest.txt not found" >&2
@@ -170,17 +169,14 @@ jobs:
 
           BR="ai-live/issue-${ISSUE}"
 
-          # Does remote branch exist?
           if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
             echo "Replay guard: remote branch $BR does not exist -> proceed"
             exit 0
           fi
 
           echo "Replay guard: remote branch $BR exists -> checking digest on that branch"
-
           git fetch --no-tags --depth=1 origin "$BR":"refs/remotes/origin/$BR"
 
-          # Try to read previously applied digest from that branch
           PREV_DIG="$(git show "origin/$BR:output/apply_digest.txt" 2>/dev/null | tr -d '\r' | head -n 1 || true)"
           if [ -z "$PREV_DIG" ]; then
             echo "Replay guard: output/apply_digest.txt not found on origin/$BR -> proceed"
@@ -222,6 +218,7 @@ jobs:
           git status -sb
 
       - name: Create branch + commit + PR
+        id: pr
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -241,5 +238,30 @@ jobs:
 
           TITLE="apply live-dev: issue #${ISSUE}"
           BODY="Applied live-dev artifact from run_id=${{ inputs.run_id }}\n\n$(cat output/apply_digest.txt)"
+
           gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
+
+          PR_NUMBER="$(gh pr view "$BR" --json number -q .number)"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "PR number: $PR_NUMBER"
+
+      - name: Enable auto-merge (squash) + delete branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          BR="ai-live/issue-${ISSUE}"
+
+          MERGED="$(gh pr view "$BR" --json merged -q .merged)"
+          if [ "$MERGED" = "true" ]; then
+            echo "PR already merged -> ok"
+            exit 0
+          fi
+
+          echo "Enabling auto-merge for $BR ..."
+          gh pr merge "$BR" --auto --squash --delete-branch
+
+          echo "OK: auto-merge enabled (will merge when requirements pass)"
