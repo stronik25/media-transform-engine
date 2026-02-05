@@ -1,85 +1,195 @@
-name: "AUTO: Apply LIVE DEV when AI Debug requests apply_live=true"
+name: "Apply LIVE DEV (by run_id)"
 
 on:
-  workflow_run:
-    workflows:
-      - "AI Debug (v5 gates; v4 deterministic default)"
-    types:
-      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "AI Debug run_id that contains artifact live-dev"
+        required: true
+        type: string
+      issue:
+        description: "Issue number (e.g. 1)"
+        required: true
+        type: string
+      base_branch:
+        description: "Base branch (usually main)"
+        required: true
+        default: "main"
+        type: string
+      dry_run:
+        description: "Validate only (no branch/PR)"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
-  actions: write
-  contents: read
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
 
 jobs:
-  auto_apply:
-    # Только если AI Debug завершился успехом
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+  validate:
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.normalize.outputs.digest }}
 
     steps:
-      - name: Decide + Dispatch Apply LIVE DEV
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Download artifact "live-dev" from AI Debug run
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          # файл workflow Apply (у тебя он apply-live.yml)
-          APPLY_WORKFLOW_FILE: "apply-live.yml"
-          BASE_BRANCH: "main"
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          rm -rf _live_dev_raw _live_dev_norm output
+          mkdir -p _live_dev_raw _live_dev_norm/.ai/dev output
+
+          gh run download "${RUN_ID}" \
+            --repo "${OWNER}/${REPO}" \
+            --name "live-dev" \
+            --dir "_live_dev_raw"
+
+          echo "Downloaded live-dev tree:"
+          find _live_dev_raw -type f -print
+
+      - name: Normalize artifact + write digest
+        id: normalize
+        shell: bash
+        env:
+          ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
 
-          echo "AI Debug run_id: ${RUN_ID}"
+          WANT="issue_${ISSUE}.md"
 
-          # 1) Скачаем preflight-out и проверим, что apply_live действительно был запросен
-          rm -rf _auto_ctx
-          mkdir -p _auto_ctx/preflight _auto_ctx/context
-
-          gh run download "${RUN_ID}" --repo "${OWNER}/${REPO}" --name "preflight-out" --dir "_auto_ctx/preflight" >/dev/null
-
-          SUMMARY_FILE="$(find _auto_ctx/preflight -type f -name summary.txt | head -n 1 || true)"
-          if [ -z "${SUMMARY_FILE}" ]; then
-            echo "AUTO-APPLY: preflight summary.txt not found -> skip"
-            exit 0
+          SRC_MD="$(find _live_dev_raw -type f -name "${WANT}" | head -n 1 || true)"
+          if [ -z "$SRC_MD" ]; then
+            echo "ERROR: ${WANT} not found in live-dev artifact" >&2
+            find _live_dev_raw -type f -print >&2
+            exit 11
           fi
 
-          echo "Found preflight summary: ${SUMMARY_FILE}"
-          cat "${SUMMARY_FILE}"
+          cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          # Ищем apply_live_input_norm=true (это пишет твой AI Debug preflight)
-          if ! grep -Eq '^apply_live_input_norm=true$' "${SUMMARY_FILE}"; then
-            echo "AUTO-APPLY: apply_live_input_norm!=true -> skip"
-            exit 0
+          for f in request.json response.json apply_digest.txt; do
+            SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
+            if [ -n "$SRC" ]; then
+              cp -f "$SRC" "_live_dev_norm/$f"
+            fi
+          done
+
+          echo "Normalized tree (including hidden):"
+          find _live_dev_norm -type f -print
+
+          MANIFEST="$(mktemp)"
+          trap 'rm -f "$MANIFEST"' EXIT
+
+          for f in "_live_dev_norm/.ai/dev/${WANT}" \
+                   "_live_dev_norm/request.json" \
+                   "_live_dev_norm/response.json"; do
+            [ -f "$f" ] && sha256sum "$f" >> "$MANIFEST"
+          done
+
+          DIGEST="$(sha256sum "$MANIFEST" | awk '{print $1}')"
+          echo "sha256:${DIGEST}" > output/apply_digest.txt
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload apply-ready artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-ready
+          path: |
+            _live_dev_norm
+            output/apply_digest.txt
+          include-hidden-files: true
+          retention-days: 7
+
+  dry_run_done:
+    if: ${{ inputs.dry_run == true }}
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "dry_run=true → validation OK"
+
+  apply:
+    if: ${{ inputs.dry_run == false }}
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: live-apply
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+
+      - name: Download apply-ready
+        uses: actions/download-artifact@v4
+        with:
+          name: apply-ready
+          path: apply_ready
+
+      - name: Show apply-ready tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "apply_ready tree:"
+          find apply_ready -type f -print
+
+      - name: Apply artifact into repo
+        shell: bash
+        env:
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+
+          WANT="issue_${ISSUE}.md"
+          SRC="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
+
+          if [ -z "$SRC" ]; then
+            echo "ERROR: ${WANT} not found after normalization" >&2
+            find apply_ready -type f -print >&2
+            exit 31
           fi
 
-          # 2) Получим номер issue из ai-debug-context (issue.json.number)
-          gh run download "${RUN_ID}" --repo "${OWNER}/${REPO}" --name "ai-debug-context" --dir "_auto_ctx/context" >/dev/null
+          DIG="$(find apply_ready -type f -name apply_digest.txt | head -n 1 || true)"
+          test -n "$DIG"
 
-          ISSUE_JSON="$(find _auto_ctx/context -type f -name issue.json | head -n 1 || true)"
-          if [ -z "${ISSUE_JSON}" ]; then
-            echo "AUTO-APPLY: issue.json not found -> skip"
-            exit 0
-          fi
+          mkdir -p .ai/dev output
+          cp -f "$SRC" ".ai/dev/${WANT}"
+          cp -f "$DIG" "output/apply_digest.txt"
 
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y jq >/dev/null
+          git status -sb
 
-          ISSUE_NUM="$(jq -r '.number // empty' "${ISSUE_JSON}")"
-          if [ -z "${ISSUE_NUM}" ]; then
-            echo "AUTO-APPLY: could not parse issue number -> skip"
-            exit 0
-          fi
+      - name: Create branch + commit + PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+          BASE: ${{ inputs.base_branch }}
+        run: |
+          set -euo pipefail
 
-          echo "AUTO-APPLY: will dispatch Apply for issue=${ISSUE_NUM}, run_id=${RUN_ID}"
+          BR="ai-live/issue-${ISSUE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 3) Диспетчим Apply LIVE DEV (он сам попросит approve через environment live-apply)
-          gh workflow run "${APPLY_WORKFLOW_FILE}" \
-            --repo "${OWNER}/${REPO}" \
-            -f run_id="${RUN_ID}" \
-            -f issue="${ISSUE_NUM}" \
-            -f base_branch="${BASE_BRANCH}" \
-            -f dry_run=false
+          git checkout -B "$BR"
+          git add .ai/dev output/apply_digest.txt
+          git commit -m "apply live-dev: issue #${ISSUE}" || true
+          git push -u origin "$BR" --force
 
-          echo "AUTO-APPLY: dispatched apply-live.yml"
+          TITLE="apply live-dev: issue #${ISSUE}"
+          BODY="Applied live-dev artifact from run_id=${{ inputs.run_id }}\n\n$(cat output/apply_digest.txt)"
+          gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
