@@ -130,8 +130,7 @@ jobs:
     needs: [validate]
     runs-on: ubuntu-latest
 
-    # If your plan supports environment approvals, this will enforce it.
-    # If not supported, it will NOT provide UI approval gating.
+    # Requires GitHub Environments approval settings to show the UI gating.
     environment: live-apply
 
     steps:
