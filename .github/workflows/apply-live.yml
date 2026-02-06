@@ -21,6 +21,16 @@ on:
         required: true
         default: true
         type: boolean
+      qa_enabled:
+        description: "Run QA gate before PR (artifact-applied tree only)"
+        required: true
+        default: true
+        type: boolean
+      write_digest_history:
+        description: "Append record to .ai/dev/digest-history.jsonl"
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -80,6 +90,7 @@ jobs:
 
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
+          # Best-effort copy request/response/digest if present anywhere inside artifact
           for f in request.json response.json apply_digest.txt; do
             SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
             if [ -n "$SRC" ]; then
@@ -146,7 +157,8 @@ jobs:
           echo "apply_ready tree:"
           find apply_ready -type f -print
 
-      - name: Replay guard (branch + digest file)
+      - name: Replay guard (GLOBAL + branch) -> sets skip flag
+        id: replay
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
@@ -167,32 +179,55 @@ jobs:
           fi
           echo "Replay guard: current digest = $CUR_DIG"
 
+          # 1) GLOBAL replay-guard (survives branch deletion after merge)
+          GLOBAL_FILE=".ai/dev/applied_digests.txt"
+          if [ -f "$GLOBAL_FILE" ]; then
+            if grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
+              echo "Replay guard (GLOBAL): digest already present in $GLOBAL_FILE -> skip (green)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Replay guard (GLOBAL): digest not found in $GLOBAL_FILE -> continue"
+          else
+            echo "Replay guard (GLOBAL): $GLOBAL_FILE not found -> continue"
+          fi
+
+          # 2) Branch replay-guard (useful if PR branch exists / re-run same issue)
           BR="ai-live/issue-${ISSUE}"
 
           if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
-            echo "Replay guard: remote branch $BR does not exist -> proceed"
+            echo "Replay guard (branch): remote branch $BR does not exist -> proceed"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Replay guard: remote branch $BR exists -> checking digest on that branch"
+          echo "Replay guard (branch): remote branch $BR exists -> checking digest on that branch"
           git fetch --no-tags --depth=1 origin "$BR":"refs/remotes/origin/$BR"
 
           PREV_DIG="$(git show "origin/$BR:output/apply_digest.txt" 2>/dev/null | tr -d '\r' | head -n 1 || true)"
           if [ -z "$PREV_DIG" ]; then
-            echo "Replay guard: output/apply_digest.txt not found on origin/$BR -> proceed"
+            echo "Replay guard (branch): output/apply_digest.txt not found on origin/$BR -> proceed"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Replay guard: previous digest on origin/$BR = $PREV_DIG"
+          echo "Replay guard (branch): previous digest on origin/$BR = $PREV_DIG"
 
           if [ "$PREV_DIG" = "$CUR_DIG" ]; then
-            echo "Replay guard: SAME digest already applied on $BR -> skipping apply (green)"
+            echo "Replay guard (branch): SAME digest already applied on $BR -> skip (green)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           echo "Replay guard: digest differs -> proceed"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Apply artifact into repo
+      - name: Stop early (replay-guard skip)
+        if: ${{ steps.replay.outputs.skip == 'true' }}
+        run: echo "replay-guard skip → green exit"
+
+      - name: Apply artifact into repo + write markers/state
+        if: ${{ steps.replay.outputs.skip != 'true' }}
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
@@ -200,24 +235,102 @@ jobs:
           set -euo pipefail
 
           WANT="issue_${ISSUE}.md"
-          SRC="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
-
-          if [ -z "$SRC" ]; then
+          SRC_MD="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
+          if [ -z "$SRC_MD" ]; then
             echo "ERROR: ${WANT} not found after normalization" >&2
             find apply_ready -type f -print >&2
             exit 31
           fi
 
-          DIG="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
-          test -n "$DIG"
+          SRC_DIG="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
+          test -n "$SRC_DIG"
+
+          SRC_REQ="$(find apply_ready -type f -path "*/request.json" | head -n 1 || true)"
+          SRC_RESP="$(find apply_ready -type f -path "*/response.json" | head -n 1 || true)"
+          # apply_ready может содержать apply_digest.txt (из live-dev), но контракт apply = output/apply_digest.txt
 
           mkdir -p .ai/dev output
-          cp -f "$SRC" ".ai/dev/${WANT}"
-          cp -f "$DIG" "output/apply_digest.txt"
+
+          # контрактная часть
+          cp -f "$SRC_MD" ".ai/dev/${WANT}"
+          cp -f "$SRC_DIG" "output/apply_digest.txt"
+
+          # (опционально) сохраняем request/response рядом с issue (удобно для аудита)
+          if [ -n "$SRC_REQ" ]; then
+            cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
+          fi
+          if [ -n "$SRC_RESP" ]; then
+            cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
+          fi
+
+          # marker: applied_ok (digest line + run_id)
+          {
+            echo "$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+            echo "run_id=${{ inputs.run_id }}"
+          } > .ai/dev/.applied_ok
+
+          # GLOBAL state: applied_digests.txt (append if not present)
+          GLOBAL_FILE=".ai/dev/applied_digests.txt"
+          touch "$GLOBAL_FILE"
+          CUR="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+          if ! grep -Fxq "$CUR" "$GLOBAL_FILE"; then
+            echo "$CUR" >> "$GLOBAL_FILE"
+          fi
+
+          # optional digest history (append jsonl)
+          if [ "${{ inputs.write_digest_history }}" = "true" ]; then
+            TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "{\"ts\":\"${TS}\",\"digest\":\"${CUR}\",\"run_id\":\"${{ inputs.run_id }}\",\"issue\":\"${ISSUE}\",\"base\":\"${{ inputs.base_branch }}\"}" >> .ai/dev/digest-history.jsonl
+          fi
 
           git status -sb
 
+      - name: No-diff guard -> sets no_diff flag
+        if: ${{ steps.replay.outputs.skip != 'true' }}
+        id: nodiff
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No diff after apply -> green skip"
+            echo "no_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changes detected -> continue"
+            echo "no_diff=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop early (no diff)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff == 'true' }}
+        run: echo "no-diff skip → green exit"
+
+      - name: QA gate (artifact-applied tree only)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' && inputs.qa_enabled == true }}
+        shell: bash
+        env:
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+
+          test -s ".ai/dev/issue_${ISSUE}.md"
+
+          D="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+          echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
+
+          # GLOBAL file must exist & contain digest we are applying
+          test -f ".ai/dev/applied_digests.txt"
+          grep -Fxq "$D" ".ai/dev/applied_digests.txt"
+
+          # If request/response exist — validate json
+          for f in ".ai/dev/request_${ISSUE}.json" ".ai/dev/response_${ISSUE}.json"; do
+            if [ -f "$f" ]; then
+              python3 -c 'import json,sys; json.load(open(sys.argv[1],"r",encoding="utf-8")); print("OK JSON:", sys.argv[1])' "$f"
+            fi
+          done
+
+          echo "QA OK"
+
       - name: Create branch + commit + PR
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
         id: pr
         shell: bash
         env:
@@ -232,7 +345,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git checkout -B "$BR"
+
+          # commit contract + markers + global replay state
           git add .ai/dev output/apply_digest.txt
+
           git commit -m "apply live-dev: issue #${ISSUE}" || true
           git push -u origin "$BR" --force
 
@@ -246,7 +362,19 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "PR number: $PR_NUMBER"
 
+      - name: Label PR (ai-live)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          BR="ai-live/issue-${ISSUE}"
+          gh pr edit "$BR" --add-label "ai-live" || true
+
       - name: Enable auto-merge (squash) + delete branch
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -255,7 +383,6 @@ jobs:
           set -euo pipefail
           BR="ai-live/issue-${ISSUE}"
 
-          # If already merged -> stop (green)
           MERGED_AT="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
           if [ -n "${MERGED_AT}" ] && [ "${MERGED_AT}" != "null" ]; then
             echo "PR already merged at ${MERGED_AT} -> ok"
@@ -273,7 +400,6 @@ jobs:
             exit 0
           fi
 
-          # If the command failed, check whether auto-merge is already enabled.
           AM_STATE="$(gh pr view "$BR" --json autoMergeRequest,mergedAt,state -q '.autoMergeRequest != null' || true)"
           MERGED_AT2="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
 
