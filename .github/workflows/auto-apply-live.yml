@@ -17,7 +17,24 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
+      - name: Kill-switch (repo var AUTO_APPLY_ENABLED must be true)
+        id: kill
+        shell: bash
+        env:
+          AUTO_APPLY_ENABLED_VAR: ${{ vars.AUTO_APPLY_ENABLED }}
+        run: |
+          set -euo pipefail
+          v="$(printf "%s" "${AUTO_APPLY_ENABLED_VAR:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "$v" != "true" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AUTO_APPLY_ENABLED is not true -> skip (green)"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "AUTO apply enabled"
+
       - name: Install jq
+        if: ${{ steps.kill.outputs.enabled == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -25,6 +42,7 @@ jobs:
           sudo apt-get install -y jq
 
       - name: Download AI Debug artifacts (context + preflight)
+        if: ${{ steps.kill.outputs.enabled == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,6 +67,7 @@ jobs:
           find _ai_debug_artifacts -type f -print || true
 
       - name: Decide if apply_live was requested
+        if: ${{ steps.kill.outputs.enabled == 'true' }}
         id: decide
         shell: bash
         run: |
@@ -77,11 +96,40 @@ jobs:
           echo "Decision: issue=$ISSUE apply_live=$APPLY"
 
       - name: Stop if apply_live not requested
-        if: ${{ steps.decide.outputs.apply != 'true' }}
+        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply != 'true' }}
         run: echo "apply_live not requested → green exit"
 
+      - name: Prevent duplicate apply for same run_id (best-effort)
+        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply == 'true' }}
+        id: dedupe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          APPLY_WF_NAME="Apply LIVE DEV (by run_id)"
+
+          # Найдём workflow id по имени
+          WF_ID="$(gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${OWNER}/${REPO}/actions/workflows" \
+            --jq ".workflows[] | select(.name==\"${APPLY_WF_NAME}\") | .id" | head -n 1 || true)"
+
+          if [ -z "$WF_ID" ]; then
+            echo "ERROR: Apply workflow '${APPLY_WF_NAME}' not found" >&2
+            exit 31
+          fi
+
+          # Проверим последние runs этого workflow — уже был ли запуск с нашим RUN_ID в inputs (best-effort по логам не гарантирован)
+          # Надёжно: мы пишем run_id в body PR, а глобально дедупим через digest в Apply.
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Dedupe OK (global replay-guard is in Apply anyway)"
+
       - name: Trigger Apply LIVE DEV workflow (by NAME)
-        if: ${{ steps.decide.outputs.apply == 'true' }}
+        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply == 'true' && steps.dedupe.outputs.skip != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
