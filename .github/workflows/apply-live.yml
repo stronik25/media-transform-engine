@@ -90,7 +90,6 @@ jobs:
 
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          # Best-effort copy request/response/digest if present anywhere inside artifact
           for f in request.json response.json apply_digest.txt; do
             SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
             if [ -n "$SRC" ]; then
@@ -179,47 +178,28 @@ jobs:
           fi
           echo "Replay guard: current digest = $CUR_DIG"
 
-          # 1) GLOBAL replay-guard (survives branch deletion after merge)
           GLOBAL_FILE=".ai/dev/applied_digests.txt"
-          if [ -f "$GLOBAL_FILE" ]; then
-            if grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
-              echo "Replay guard (GLOBAL): digest already present in $GLOBAL_FILE -> skip (green)"
-              echo "skip=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "Replay guard (GLOBAL): digest not found in $GLOBAL_FILE -> continue"
-          else
-            echo "Replay guard (GLOBAL): $GLOBAL_FILE not found -> continue"
+          if [ -f "$GLOBAL_FILE" ] && grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
+            echo "Replay guard (GLOBAL): digest already present -> skip (green)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          # 2) Branch replay-guard (useful if PR branch exists / re-run same issue)
           BR="ai-live/issue-${ISSUE}"
-
           if ! git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
             echo "Replay guard (branch): remote branch $BR does not exist -> proceed"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Replay guard (branch): remote branch $BR exists -> checking digest on that branch"
           git fetch --no-tags --depth=1 origin "$BR":"refs/remotes/origin/$BR"
-
           PREV_DIG="$(git show "origin/$BR:output/apply_digest.txt" 2>/dev/null | tr -d '\r' | head -n 1 || true)"
-          if [ -z "$PREV_DIG" ]; then
-            echo "Replay guard (branch): output/apply_digest.txt not found on origin/$BR -> proceed"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Replay guard (branch): previous digest on origin/$BR = $PREV_DIG"
-
-          if [ "$PREV_DIG" = "$CUR_DIG" ]; then
-            echo "Replay guard (branch): SAME digest already applied on $BR -> skip (green)"
+          if [ -n "$PREV_DIG" ] && [ "$PREV_DIG" = "$CUR_DIG" ]; then
+            echo "Replay guard (branch): SAME digest -> skip (green)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Replay guard: digest differs -> proceed"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Stop early (replay-guard skip)
@@ -247,15 +227,11 @@ jobs:
 
           SRC_REQ="$(find apply_ready -type f -path "*/request.json" | head -n 1 || true)"
           SRC_RESP="$(find apply_ready -type f -path "*/response.json" | head -n 1 || true)"
-          # apply_ready может содержать apply_digest.txt (из live-dev), но контракт apply = output/apply_digest.txt
 
           mkdir -p .ai/dev output
-
-          # контрактная часть
           cp -f "$SRC_MD" ".ai/dev/${WANT}"
           cp -f "$SRC_DIG" "output/apply_digest.txt"
 
-          # (опционально) сохраняем request/response рядом с issue (удобно для аудита)
           if [ -n "$SRC_REQ" ]; then
             cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
           fi
@@ -263,21 +239,19 @@ jobs:
             cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
           fi
 
-          # marker: applied_ok (digest line + run_id)
+          CUR="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+
           {
-            echo "$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+            echo "$CUR"
             echo "run_id=${{ inputs.run_id }}"
           } > .ai/dev/.applied_ok
 
-          # GLOBAL state: applied_digests.txt (append if not present)
           GLOBAL_FILE=".ai/dev/applied_digests.txt"
           touch "$GLOBAL_FILE"
-          CUR="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
           if ! grep -Fxq "$CUR" "$GLOBAL_FILE"; then
             echo "$CUR" >> "$GLOBAL_FILE"
           fi
 
-          # optional digest history (append jsonl)
           if [ "${{ inputs.write_digest_history }}" = "true" ]; then
             TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
             echo "{\"ts\":\"${TS}\",\"digest\":\"${CUR}\",\"run_id\":\"${{ inputs.run_id }}\",\"issue\":\"${ISSUE}\",\"base\":\"${{ inputs.base_branch }}\"}" >> .ai/dev/digest-history.jsonl
@@ -303,6 +277,24 @@ jobs:
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff == 'true' }}
         run: echo "no-diff skip → green exit"
 
+      - name: Allowlist guard (fail if changes outside allowed paths)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Allowed:
+          # - .ai/dev/** (including .applied_ok, applied_digests.txt, history, request/response)
+          # - output/apply_digest.txt
+          # Everything else => fail
+          BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt)$' || true)"
+          if [ -n "$BAD" ]; then
+            echo "ERROR: changes outside allowlist:" >&2
+            echo "$BAD" >&2
+            exit 61
+          fi
+          echo "Allowlist OK"
+
       - name: QA gate (artifact-applied tree only)
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' && inputs.qa_enabled == true }}
         shell: bash
@@ -316,11 +308,9 @@ jobs:
           D="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
           echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
 
-          # GLOBAL file must exist & contain digest we are applying
           test -f ".ai/dev/applied_digests.txt"
           grep -Fxq "$D" ".ai/dev/applied_digests.txt"
 
-          # If request/response exist — validate json
           for f in ".ai/dev/request_${ISSUE}.json" ".ai/dev/response_${ISSUE}.json"; do
             if [ -f "$f" ]; then
               python3 -c 'import json,sys; json.load(open(sys.argv[1],"r",encoding="utf-8")); print("OK JSON:", sys.argv[1])' "$f"
@@ -346,7 +336,6 @@ jobs:
 
           git checkout -B "$BR"
 
-          # commit contract + markers + global replay state
           git add .ai/dev output/apply_digest.txt
 
           git commit -m "apply live-dev: issue #${ISSUE}" || true
