@@ -68,6 +68,9 @@ jobs:
             --name "live-dev" \
             --dir "_live_dev_raw"
 
+          echo "Downloaded live-dev tree:"
+          find _live_dev_raw -type f -print
+
       - name: Normalize artifact + write digest
         id: normalize
         shell: bash
@@ -78,10 +81,15 @@ jobs:
 
           WANT="issue_${ISSUE}.md"
           SRC_MD="$(find _live_dev_raw -type f -name "${WANT}" | head -n 1 || true)"
-          test -n "$SRC_MD"
+          if [ -z "$SRC_MD" ]; then
+            echo "ERROR: ${WANT} not found in live-dev artifact" >&2
+            find _live_dev_raw -type f -print >&2
+            exit 11
+          fi
 
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
+          # Best-effort copy request/response (if present anywhere)
           for f in request.json response.json apply_digest.txt; do
             SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
             [ -n "$SRC" ] && cp -f "$SRC" "_live_dev_norm/$f"
@@ -89,6 +97,7 @@ jobs:
 
           MANIFEST="$(mktemp)"
           trap 'rm -f "$MANIFEST"' EXIT
+
           sha256sum "_live_dev_norm/.ai/dev/${WANT}" >> "$MANIFEST"
           [ -f "_live_dev_norm/request.json" ] && sha256sum "_live_dev_norm/request.json" >> "$MANIFEST"
           [ -f "_live_dev_norm/response.json" ] && sha256sum "_live_dev_norm/response.json" >> "$MANIFEST"
@@ -133,7 +142,14 @@ jobs:
           name: apply-ready
           path: apply_ready
 
-      - name: Replay guard (GLOBAL + branch)
+      - name: Show apply-ready tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "apply_ready tree:"
+          find apply_ready -type f -print
+
+      - name: Replay guard (GLOBAL + branch) -> sets skip flag
         id: replay
         shell: bash
         env:
@@ -141,21 +157,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          CUR_DIG="$(cat apply_ready/output/apply_digest.txt | tr -d '\r')"
-          test "$CUR_DIG" != ""
+          CUR_DIG_FILE="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
+          if [ -z "$CUR_DIG_FILE" ]; then
+            echo "ERROR: apply_ready/output/apply_digest.txt not found" >&2
+            find apply_ready -type f -print >&2
+            exit 41
+          fi
 
-          GLOBAL=".ai/dev/applied_digests.txt"
-          if [ -f "$GLOBAL" ] && grep -Fxq "$CUR_DIG" "$GLOBAL"; then
+          CUR_DIG="$(cat "$CUR_DIG_FILE" | tr -d '\r' | head -n 1)"
+          if ! echo "$CUR_DIG" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: invalid current digest format: $CUR_DIG" >&2
+            exit 42
+          fi
+
+          GLOBAL_FILE=".ai/dev/applied_digests.txt"
+          if [ -f "$GLOBAL_FILE" ] && grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
+            echo "Replay guard (GLOBAL): digest already present -> skip (green)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          BR="ai-live/issue-${ISSUE}"
+          if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+            git fetch --no-tags --depth=1 origin "$BR":"refs/remotes/origin/$BR"
+            PREV_DIG="$(git show "origin/$BR:output/apply_digest.txt" 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+            if [ -n "$PREV_DIG" ] && [ "$PREV_DIG" = "$CUR_DIG" ]; then
+              echo "Replay guard (branch): SAME digest -> skip (green)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Stop early (replay)
+      - name: Stop early (replay-guard skip)
         if: ${{ steps.replay.outputs.skip == 'true' }}
-        run: echo "replay skip"
+        run: echo "replay-guard skip → green exit"
 
-      - name: Apply artifact
+      - name: Apply artifact into repo + write markers/state
         if: ${{ steps.replay.outputs.skip != 'true' }}
         shell: bash
         env:
@@ -163,42 +202,78 @@ jobs:
         run: |
           set -euo pipefail
 
+          WANT="issue_${ISSUE}.md"
+          SRC_MD="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
+          if [ -z "$SRC_MD" ]; then
+            echo "ERROR: ${WANT} not found inside apply_ready" >&2
+            find apply_ready -type f -print >&2
+            exit 31
+          fi
+
+          SRC_DIG="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
+          if [ -z "$SRC_DIG" ]; then
+            echo "ERROR: output/apply_digest.txt not found inside apply_ready" >&2
+            find apply_ready -type f -print >&2
+            exit 32
+          fi
+
+          SRC_REQ="$(find apply_ready -type f -name "request.json" | head -n 1 || true)"
+          SRC_RESP="$(find apply_ready -type f -name "response.json" | head -n 1 || true)"
+
           mkdir -p .ai/dev output
+          cp -f "$SRC_MD" ".ai/dev/${WANT}"
+          cp -f "$SRC_DIG" "output/apply_digest.txt"
 
-          cp -f apply_ready/.ai/dev/issue_${ISSUE}.md .ai/dev/
-          cp -f apply_ready/output/apply_digest.txt output/
+          [ -n "$SRC_REQ" ] && cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
+          [ -n "$SRC_RESP" ] && cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
 
-          cp -f apply_ready/request.json .ai/dev/request_${ISSUE}.json 2>/dev/null || true
-          cp -f apply_ready/response.json .ai/dev/response_${ISSUE}.json 2>/dev/null || true
+          CUR="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
 
-          CUR="$(cat output/apply_digest.txt)"
-          echo "$CUR" > .ai/dev/.applied_ok
+          {
+            echo "$CUR"
+            echo "run_id=${{ inputs.run_id }}"
+          } > .ai/dev/.applied_ok
 
           touch .ai/dev/applied_digests.txt
           grep -Fxq "$CUR" .ai/dev/applied_digests.txt || echo "$CUR" >> .ai/dev/applied_digests.txt
 
-          [ "${{ inputs.write_digest_history }}" = "true" ] && \
-            echo "{\"ts\":\"$(date -u +%FT%TZ)\",\"digest\":\"$CUR\",\"run_id\":\"${{ inputs.run_id }}\"}" >> .ai/dev/digest-history.jsonl
+          if [ "${{ inputs.write_digest_history }}" = "true" ]; then
+            echo "{\"ts\":\"$(date -u +%FT%TZ)\",\"digest\":\"$CUR\",\"run_id\":\"${{ inputs.run_id }}\",\"issue\":\"${ISSUE}\",\"base\":\"${{ inputs.base_branch }}\"}" >> .ai/dev/digest-history.jsonl
+          fi
 
-      - name: No-diff guard
+          git status -sb
+
+      - name: No-diff guard -> sets no_diff flag
+        if: ${{ steps.replay.outputs.skip != 'true' }}
         id: nodiff
         shell: bash
         run: |
-          git diff --quiet && echo "no_diff=true" >> "$GITHUB_OUTPUT" || echo "no_diff=false" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "no_diff=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_diff=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Stop early (no diff)
-        if: ${{ steps.nodiff.outputs.no_diff == 'true' }}
-        run: echo "no diff"
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff == 'true' }}
+        run: echo "no-diff skip → green exit"
 
-      - name: Allowlist guard
-        if: ${{ steps.nodiff.outputs.no_diff != 'true' }}
+      - name: Allowlist guard (fail if changes outside allowed paths)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
         shell: bash
         run: |
+          set -euo pipefail
           BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt$)' || true)"
-          [ -z "$BAD" ] || { echo "$BAD"; exit 61; }
+          if [ -n "$BAD" ]; then
+            echo "ERROR: changes outside allowlist:" >&2
+            echo "$BAD" >&2
+            exit 61
+          fi
+          echo "Allowlist OK"
 
-      - name: QA gate (STRICT)
-        if: ${{ inputs.qa_enabled == true && steps.nodiff.outputs.no_diff != 'true' }}
+      - name: QA gate (STRICT, artifact-applied tree only)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' && inputs.qa_enabled == true }}
         shell: bash
         env:
           ISSUE: ${{ inputs.issue }}
@@ -206,27 +281,74 @@ jobs:
           set -euo pipefail
 
           test -s ".ai/dev/issue_${ISSUE}.md"
-          grep -Eq '^# ' ".ai/dev/issue_${ISSUE}.md"
-          grep -Eq '^## Goal' ".ai/dev/issue_${ISSUE}.md"
-          grep -Eq '^## Expected' ".ai/dev/issue_${ISSUE}.md"
-
           test -f ".ai/dev/.applied_ok"
           test -f ".ai/dev/applied_digests.txt"
           test -f "output/apply_digest.txt"
 
-          D="$(cat output/apply_digest.txt)"
+          D="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
+          echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
           grep -Fxq "$D" ".ai/dev/applied_digests.txt"
 
-          ALLOWED="^\.ai/dev/(issue_${ISSUE}\.md|\.applied_ok|applied_digests\.txt|digest-history\.jsonl|request_${ISSUE}\.json|response_${ISSUE}\.json)$"
-          BAD="$(find .ai/dev -type f | grep -Ev "$ALLOWED" || true)"
-          [ -z "$BAD" ] || { echo "$BAD"; exit 71; }
+          MD=".ai/dev/issue_${ISSUE}.md"
+          grep -Eq '^# ' "$MD"
+          grep -Eq '^## Goal' "$MD"
+          grep -Eq '^## Expected' "$MD"
 
-          for f in .ai/dev/request_${ISSUE}.json .ai/dev/response_${ISSUE}.json; do
-            [ -f "$f" ] && python3 -c 'import json,sys;json.load(open(sys.argv[1]))' "$f"
+          ALLOWED_RE="^\.ai/dev/(issue_${ISSUE}\.md|\.applied_ok|applied_digests\.txt|digest-history\.jsonl|request_${ISSUE}\.json|response_${ISSUE}\.json)$"
+          BAD_DEV="$(find .ai/dev -type f | grep -Ev "$ALLOWED_RE" || true)"
+          if [ -n "$BAD_DEV" ]; then
+            echo "ERROR: unexpected files in .ai/dev:" >&2
+            echo "$BAD_DEV" >&2
+            exit 71
+          fi
+
+          for f in ".ai/dev/request_${ISSUE}.json" ".ai/dev/response_${ISSUE}.json"; do
+            if [ -f "$f" ]; then
+              python3 -c 'import json,sys; json.load(open(sys.argv[1],"r",encoding="utf-8"))' "$f"
+              echo "OK JSON: $f"
+            fi
           done
 
-      - name: Create PR + auto-merge
-        if: ${{ steps.nodiff.outputs.no_diff != 'true' }}
+          echo "QA OK (STRICT)"
+
+      - name: Create branch + commit + PR
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+          BASE: ${{ inputs.base_branch }}
+        run: |
+          set -euo pipefail
+
+          BR="ai-live/issue-${ISSUE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BR"
+          git add .ai/dev output/apply_digest.txt
+          git commit -m "apply live-dev: issue #${ISSUE}" || true
+          git push -u origin "$BR" --force
+
+          TITLE="apply live-dev: issue #${ISSUE}"
+          BODY="Applied live-dev artifact from run_id=${{ inputs.run_id }}\n\n$(cat output/apply_digest.txt)"
+
+          gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
+          gh pr edit "$BR" --title "$TITLE" --body "$BODY"
+
+      - name: Label PR (ai-live)
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          BR="ai-live/issue-${ISSUE}"
+          gh pr edit "$BR" --add-label "ai-live" || true
+
+      - name: Enable auto-merge (squash) + delete branch
+        if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -235,12 +357,34 @@ jobs:
           set -euo pipefail
           BR="ai-live/issue-${ISSUE}"
 
-          git checkout -B "$BR"
-          git add .ai/dev output/apply_digest.txt
-          git commit -m "apply live-dev: issue #${ISSUE}" || true
-          git push -u origin "$BR" --force
+          MERGED_AT="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
+          if [ -n "${MERGED_AT}" ] && [ "${MERGED_AT}" != "null" ]; then
+            echo "PR already merged at ${MERGED_AT} -> ok"
+            exit 0
+          fi
 
-          gh pr create --base main --head "$BR" --title "apply live-dev: issue #${ISSUE}" \
-            --body "Applied artifact run_id=${{ inputs.run_id }}" 2>/dev/null || true
-
+          set +e
           gh pr merge "$BR" --auto --squash --delete-branch
+          RC=$?
+          set -e
+
+          if [ $RC -eq 0 ]; then
+            echo "OK: auto-merge enabled"
+            exit 0
+          fi
+
+          AM_STATE="$(gh pr view "$BR" --json autoMergeRequest -q '.autoMergeRequest != null' || true)"
+          MERGED_AT2="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
+
+          if [ -n "${MERGED_AT2}" ] && [ "${MERGED_AT2}" != "null" ]; then
+            echo "PR got merged meanwhile -> ok"
+            exit 0
+          fi
+
+          if [ "$AM_STATE" = "true" ]; then
+            echo "Auto-merge already enabled -> ok"
+            exit 0
+          fi
+
+          echo "ERROR: failed to enable auto-merge (and it is not enabled)."
+          exit 1
