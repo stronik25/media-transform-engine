@@ -74,14 +74,13 @@ jobs:
 
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
           echo "apply=$APPLY" >> "$GITHUB_OUTPUT"
-
           echo "Decision: issue=$ISSUE apply_live=$APPLY"
 
       - name: Stop if apply_live not requested
         if: ${{ steps.decide.outputs.apply != 'true' }}
         run: echo "apply_live not requested → green exit"
 
-      - name: Trigger Apply LIVE DEV workflow
+      - name: Trigger Apply LIVE DEV workflow (by NAME)
         if: ${{ steps.decide.outputs.apply == 'true' }}
         shell: bash
         env:
@@ -93,8 +92,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Must match the workflow file name: .github/workflows/apply-live-dev.yml
-          gh workflow run apply-live-dev.yml \
+          gh workflow run "Apply LIVE DEV (by run_id)" \
             --repo "${OWNER}/${REPO}" \
             --ref "main" \
             -f run_id="${RUN_ID}" \
