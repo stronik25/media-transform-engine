@@ -93,7 +93,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # IMPORTANT: use correct workflow file name
+          # Must match the workflow file name: .github/workflows/apply-live-dev.yml
           gh workflow run apply-live-dev.yml \
             --repo "${OWNER}/${REPO}" \
             --ref "main" \
