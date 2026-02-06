@@ -284,10 +284,9 @@ jobs:
           set -euo pipefail
 
           # Allowed:
-          # - .ai/dev/** (including .applied_ok, applied_digests.txt, history, request/response)
+          # - .ai/dev/** (any file under it)
           # - output/apply_digest.txt
-          # Everything else => fail
-          BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt)$' || true)"
+          BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt$)' || true)"
           if [ -n "$BAD" ]; then
             echo "ERROR: changes outside allowlist:" >&2
             echo "$BAD" >&2
