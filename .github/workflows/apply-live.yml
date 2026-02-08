@@ -43,7 +43,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.normalize.outputs.digest }}
-
     steps:
       - name: Checkout base branch
         uses: actions/checkout@v4
@@ -224,6 +223,7 @@ jobs:
           cp -f "$SRC_MD" ".ai/dev/${WANT}"
           cp -f "$SRC_DIG" "output/apply_digest.txt"
 
+          # Keep request/response under .ai/dev with issue suffix (optional but allowed)
           [ -n "$SRC_REQ" ] && cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
           [ -n "$SRC_RESP" ] && cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
 
@@ -264,6 +264,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Allow ONLY:
+          # - .ai/dev/**
+          # - output/apply_digest.txt
           BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt$)' || true)"
           if [ -n "$BAD" ]; then
             echo "ERROR: changes outside allowlist:" >&2
@@ -294,6 +297,7 @@ jobs:
           grep -Eq '^## Goal' "$MD"
           grep -Eq '^## Expected' "$MD"
 
+          # Only expected files under .ai/dev
           ALLOWED_RE="^\.ai/dev/(issue_${ISSUE}\.md|\.applied_ok|applied_digests\.txt|digest-history\.jsonl|request_${ISSUE}\.json|response_${ISSUE}\.json)$"
           BAD_DEV="$(find .ai/dev -type f | grep -Ev "$ALLOWED_RE" || true)"
           if [ -n "$BAD_DEV" ]; then
