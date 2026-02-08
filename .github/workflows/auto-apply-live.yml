@@ -17,24 +17,7 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      - name: Kill-switch (repo var AUTO_APPLY_ENABLED must be true)
-        id: kill
-        shell: bash
-        env:
-          AUTO_APPLY_ENABLED_VAR: ${{ vars.AUTO_APPLY_ENABLED }}
-        run: |
-          set -euo pipefail
-          v="$(printf "%s" "${AUTO_APPLY_ENABLED_VAR:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-          if [ "$v" != "true" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "AUTO_APPLY_ENABLED is not true -> skip (green)"
-            exit 0
-          fi
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-          echo "AUTO apply enabled"
-
       - name: Install jq
-        if: ${{ steps.kill.outputs.enabled == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -42,7 +25,6 @@ jobs:
           sudo apt-get install -y jq
 
       - name: Download AI Debug artifacts (context + preflight)
-        if: ${{ steps.kill.outputs.enabled == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,8 +33,8 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          rm -rf _ai_debug_artifacts
-          mkdir -p _ai_debug_artifacts/context _ai_debug_artifacts/preflight
+          rm -rf _ai_debug_artifacts _auto_out
+          mkdir -p _ai_debug_artifacts/context _ai_debug_artifacts/preflight _auto_out
 
           gh run download "${RUN_ID}" \
             --repo "${OWNER}/${REPO}" \
@@ -64,14 +46,32 @@ jobs:
             --name "preflight-out" \
             --dir "_ai_debug_artifacts/preflight" || true
 
-          find _ai_debug_artifacts -type f -print || true
+          echo "Artifacts:"
+          find _ai_debug_artifacts -type f -maxdepth 6 -print || true
 
-      - name: Decide if apply_live was requested
-        if: ${{ steps.kill.outputs.enabled == 'true' }}
+      - name: Decide (apply_live + kill-switch + mode)
         id: decide
         shell: bash
+        env:
+          AUTO_APPLY_ENABLED: ${{ vars.AUTO_APPLY_ENABLED }}
+          AUTO_APPLY_MODE: ${{ vars.AUTO_APPLY_MODE }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
+
+          norm_bool () {
+            v="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            [ "$v" = "true" ] && echo "true" || echo "false"
+          }
+
+          ENABLED="$(norm_bool "${AUTO_APPLY_ENABLED:-false}")"
+          MODE="$(printf "%s" "${AUTO_APPLY_MODE:-apply}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          [ -n "$MODE" ] || MODE="apply"
+          if [ "$MODE" != "apply" ] && [ "$MODE" != "dry-run" ]; then
+            MODE="invalid"
+          fi
 
           ISSUE_JSON="$(find _ai_debug_artifacts/context -type f -name issue.json | head -n 1 || true)"
           if [ -z "$ISSUE_JSON" ]; then
@@ -85,51 +85,72 @@ jobs:
             exit 22
           fi
 
-          APPLY="false"
+          APPLY_REQ="false"
           SUMMARY_TXT="$(find _ai_debug_artifacts/preflight -type f -name summary.txt | head -n 1 || true)"
           if [ -n "$SUMMARY_TXT" ] && grep -Eq '^apply_live_input_norm=true$' "$SUMMARY_TXT"; then
-            APPLY="true"
+            APPLY_REQ="true"
           fi
+
+          SHOULD_TRIGGER="false"
+          REASON=""
+
+          if [ "$ENABLED" != "true" ]; then
+            REASON="AUTO_APPLY_ENABLED!=true"
+          elif [ "$APPLY_REQ" != "true" ]; then
+            REASON="apply_live_not_requested"
+          elif [ "$MODE" = "invalid" ]; then
+            REASON="AUTO_APPLY_MODE_invalid"
+          elif [ "$MODE" = "dry-run" ]; then
+            REASON="AUTO_APPLY_MODE=dry-run"
+          else
+            SHOULD_TRIGGER="true"
+            REASON="apply"
+          fi
+
+          mkdir -p _auto_out
+          jq -n \
+            --arg owner "$OWNER" \
+            --arg repo "$REPO" \
+            --arg ai_debug_run_id "$RUN_ID" \
+            --arg issue "$ISSUE" \
+            --arg auto_apply_enabled_norm "$ENABLED" \
+            --arg auto_apply_mode_norm "$MODE" \
+            --arg reason "$REASON" \
+            --argjson apply_live_requested "$( [ "$APPLY_REQ" = "true" ] && echo true || echo false )" \
+            --argjson should_trigger_apply "$( [ "$SHOULD_TRIGGER" = "true" ] && echo true || echo false )" \
+            '{
+              owner: $owner,
+              repo: $repo,
+              ai_debug_run_id: $ai_debug_run_id,
+              issue: $issue,
+              apply_live_requested: $apply_live_requested,
+              auto_apply_enabled_norm: $auto_apply_enabled_norm,
+              auto_apply_mode_norm: $auto_apply_mode_norm,
+              should_trigger_apply: $should_trigger_apply,
+              reason: $reason
+            }' > _auto_out/decision.json
 
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
-          echo "apply=$APPLY" >> "$GITHUB_OUTPUT"
-          echo "Decision: issue=$ISSUE apply_live=$APPLY"
+          echo "should_trigger=$SHOULD_TRIGGER" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
 
-      - name: Stop if apply_live not requested
-        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply != 'true' }}
-        run: echo "apply_live not requested → green exit"
+          echo "Decision:"
+          cat _auto_out/decision.json
 
-      - name: Prevent duplicate apply for same run_id (best-effort)
-        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply == 'true' }}
-        id: dedupe
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.repository.name }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-        run: |
-          set -euo pipefail
+      - name: Upload AUTO decision artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-apply-decision
+          path: _auto_out/decision.json
+          retention-days: 14
 
-          APPLY_WF_NAME="Apply LIVE DEV (by run_id)"
+      - name: Stop (no trigger)
+        if: ${{ steps.decide.outputs.should_trigger != 'true' }}
+        run: echo "AUTO: not triggering Apply (green). reason=${{ steps.decide.outputs.reason }}"
 
-          # Найдём workflow id по имени
-          WF_ID="$(gh api -H "Accept: application/vnd.github+json" \
-            "/repos/${OWNER}/${REPO}/actions/workflows" \
-            --jq ".workflows[] | select(.name==\"${APPLY_WF_NAME}\") | .id" | head -n 1 || true)"
-
-          if [ -z "$WF_ID" ]; then
-            echo "ERROR: Apply workflow '${APPLY_WF_NAME}' not found" >&2
-            exit 31
-          fi
-
-          # Проверим последние runs этого workflow — уже был ли запуск с нашим RUN_ID в inputs (best-effort по логам не гарантирован)
-          # Надёжно: мы пишем run_id в body PR, а глобально дедупим через digest в Apply.
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "Dedupe OK (global replay-guard is in Apply anyway)"
-
-      - name: Trigger Apply LIVE DEV workflow (by NAME)
-        if: ${{ steps.kill.outputs.enabled == 'true' && steps.decide.outputs.apply == 'true' && steps.dedupe.outputs.skip != 'true' }}
+      - name: Trigger Apply LIVE DEV workflow (by name)
+        if: ${{ steps.decide.outputs.should_trigger == 'true' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -150,4 +171,4 @@ jobs:
             -f qa_enabled="true" \
             -f write_digest_history="true"
 
-          echo "Apply LIVE DEV triggered automatically"
+          echo "AUTO: Apply triggered"
