@@ -89,7 +89,7 @@ jobs:
 
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          # Best-effort copy request/response (if present anywhere)
+          # Best-effort copy request/response/digest if present anywhere inside artifact
           for f in request.json response.json apply_digest.txt; do
             SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
             [ -n "$SRC" ] && cp -f "$SRC" "_live_dev_norm/$f"
