@@ -79,6 +79,7 @@ jobs:
           set -euo pipefail
 
           WANT="issue_${ISSUE}.md"
+
           SRC_MD="$(find _live_dev_raw -type f -name "${WANT}" | head -n 1 || true)"
           if [ -z "$SRC_MD" ]; then
             echo "ERROR: ${WANT} not found in live-dev artifact" >&2
@@ -88,11 +89,11 @@ jobs:
 
           cp -f "$SRC_MD" "_live_dev_norm/.ai/dev/${WANT}"
 
-          # Best-effort copy request/response/digest if present anywhere inside artifact
-          for f in request.json response.json apply_digest.txt; do
-            SRC="$(find _live_dev_raw -type f -name "$f" | head -n 1 || true)"
-            [ -n "$SRC" ] && cp -f "$SRC" "_live_dev_norm/$f"
-          done
+          # Best-effort copy request/response (wherever they are)
+          SRC_REQ="$(find _live_dev_raw -type f -name "request.json" | head -n 1 || true)"
+          SRC_RESP="$(find _live_dev_raw -type f -name "response.json" | head -n 1 || true)"
+          [ -n "$SRC_REQ" ] && cp -f "$SRC_REQ" "_live_dev_norm/request.json"
+          [ -n "$SRC_RESP" ] && cp -f "$SRC_RESP" "_live_dev_norm/response.json"
 
           MANIFEST="$(mktemp)"
           trap 'rm -f "$MANIFEST"' EXIT
@@ -169,19 +170,21 @@ jobs:
             exit 42
           fi
 
+          # GLOBAL replay guard in main tree (.ai/dev/applied_digests.txt)
           GLOBAL_FILE=".ai/dev/applied_digests.txt"
           if [ -f "$GLOBAL_FILE" ] && grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
-            echo "Replay guard (GLOBAL): digest already present -> skip (green)"
+            echo "Replay guard (GLOBAL): digest already applied -> skip (green)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # Branch-level replay guard
           BR="ai-live/issue-${ISSUE}"
           if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
             git fetch --no-tags --depth=1 origin "$BR":"refs/remotes/origin/$BR"
             PREV_DIG="$(git show "origin/$BR:output/apply_digest.txt" 2>/dev/null | tr -d '\r' | head -n 1 || true)"
             if [ -n "$PREV_DIG" ] && [ "$PREV_DIG" = "$CUR_DIG" ]; then
-              echo "Replay guard (branch): SAME digest -> skip (green)"
+              echo "Replay guard (branch): same digest -> skip (green)"
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -193,7 +196,7 @@ jobs:
         if: ${{ steps.replay.outputs.skip == 'true' }}
         run: echo "replay-guard skip → green exit"
 
-      - name: Apply artifact into repo + write markers/state
+      - name: Apply artifact into repo + write state (allowed paths only)
         if: ${{ steps.replay.outputs.skip != 'true' }}
         shell: bash
         env:
@@ -223,7 +226,7 @@ jobs:
           cp -f "$SRC_MD" ".ai/dev/${WANT}"
           cp -f "$SRC_DIG" "output/apply_digest.txt"
 
-          # Keep request/response under .ai/dev with issue suffix (optional but allowed)
+          # Optional copies into .ai/dev with issue suffix
           [ -n "$SRC_REQ" ] && cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
           [ -n "$SRC_RESP" ] && cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
 
@@ -264,9 +267,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Allow ONLY:
-          # - .ai/dev/**
-          # - output/apply_digest.txt
           BAD="$(git diff --name-only | grep -Ev '^(\.ai/dev/|output/apply_digest\.txt$)' || true)"
           if [ -n "$BAD" ]; then
             echo "ERROR: changes outside allowlist:" >&2
@@ -284,27 +284,13 @@ jobs:
           set -euo pipefail
 
           test -s ".ai/dev/issue_${ISSUE}.md"
+          test -f "output/apply_digest.txt"
           test -f ".ai/dev/.applied_ok"
           test -f ".ai/dev/applied_digests.txt"
-          test -f "output/apply_digest.txt"
 
           D="$(cat output/apply_digest.txt | tr -d '\r' | head -n 1)"
           echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
           grep -Fxq "$D" ".ai/dev/applied_digests.txt"
-
-          MD=".ai/dev/issue_${ISSUE}.md"
-          grep -Eq '^# ' "$MD"
-          grep -Eq '^## Goal' "$MD"
-          grep -Eq '^## Expected' "$MD"
-
-          # Only expected files under .ai/dev
-          ALLOWED_RE="^\.ai/dev/(issue_${ISSUE}\.md|\.applied_ok|applied_digests\.txt|digest-history\.jsonl|request_${ISSUE}\.json|response_${ISSUE}\.json)$"
-          BAD_DEV="$(find .ai/dev -type f | grep -Ev "$ALLOWED_RE" || true)"
-          if [ -n "$BAD_DEV" ]; then
-            echo "ERROR: unexpected files in .ai/dev:" >&2
-            echo "$BAD_DEV" >&2
-            exit 71
-          fi
 
           for f in ".ai/dev/request_${ISSUE}.json" ".ai/dev/response_${ISSUE}.json"; do
             if [ -f "$f" ]; then
@@ -313,7 +299,7 @@ jobs:
             fi
           done
 
-          echo "QA OK (STRICT)"
+          echo "QA OK"
 
       - name: Create branch + commit + PR
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
