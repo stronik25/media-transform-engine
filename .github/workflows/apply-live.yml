@@ -124,20 +124,29 @@ jobs:
     environment: live-apply
 
     steps:
-      - name: Download apply-ready
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf apply_ready
+          mkdir -p apply_ready
+
+      - name: Download apply-ready (from this workflow run)
         uses: actions/download-artifact@v4
         with:
           name: apply-ready
           path: apply_ready
+          run-id: ${{ github.run_id }}
 
-      - name: Show apply-ready tree
+      - name: Assert apply-ready exists
         shell: bash
         run: |
           set -euo pipefail
           echo "apply_ready tree:"
           find apply_ready -type f -print
+          test -f "apply_ready/output/apply_digest.txt"
 
-      - name: QA gate (STRICT, ARTIFACT-ONLY, no git, no network)
+      - name: QA gate (STRICT, ARTIFACT-ONLY, no git)
         if: ${{ inputs.qa_enabled == true }}
         shell: bash
         env:
@@ -145,12 +154,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1) Strict artifact file allowlist (inside apply_ready)
-          # Allowed files:
-          # - apply_ready/_live_dev_norm/.ai/dev/issue_<ISSUE>.md
-          # - apply_ready/_live_dev_norm/request.json (optional)
-          # - apply_ready/_live_dev_norm/response.json (optional)
-          # - apply_ready/output/apply_digest.txt
           WANT="issue_${ISSUE}.md"
 
           BAD_FILES="$(find apply_ready -type f -print | sed 's|^\./||' | grep -Ev "^apply_ready/(_live_dev_norm/\.ai/dev/${WANT}|_live_dev_norm/request\.json|_live_dev_norm/response\.json|output/apply_digest\.txt)$" || true)"
@@ -160,15 +163,12 @@ jobs:
             exit 71
           fi
 
-          # 2) Required files exist + non-empty where needed
           test -s "apply_ready/_live_dev_norm/.ai/dev/${WANT}"
           test -s "apply_ready/output/apply_digest.txt"
 
-          # 3) Digest format validation
           D="$(cat apply_ready/output/apply_digest.txt | tr -d '\r' | head -n 1)"
           echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
 
-          # 4) Optional JSON validity (no jq install, use python stdlib)
           for f in "apply_ready/_live_dev_norm/request.json" "apply_ready/_live_dev_norm/response.json"; do
             if [ -f "$f" ]; then
               python3 -c 'import json,sys; json.load(open(sys.argv[1],"r",encoding="utf-8"))' "$f"
@@ -261,7 +261,6 @@ jobs:
           cp -f "$SRC_MD" ".ai/dev/${WANT}"
           cp -f "$SRC_DIG" "output/apply_digest.txt"
 
-          # Optional copies into .ai/dev with issue suffix
           [ -n "$SRC_REQ" ] && cp -f "$SRC_REQ" ".ai/dev/request_${ISSUE}.json"
           [ -n "$SRC_RESP" ] && cp -f "$SRC_RESP" ".ai/dev/response_${ISSUE}.json"
 
