@@ -49,6 +49,23 @@ jobs:
     outputs:
       digest: ${{ steps.normalize.outputs.digest }}
     steps:
+      - name: Validate inputs (contract)
+        shell: bash
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          set -euo pipefail
+          if ! echo "${RUN_ID}" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: inputs.run_id must be numeric. got=${RUN_ID}" >&2
+            exit 10
+          fi
+          if ! echo "${ISSUE}" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: inputs.issue must be numeric. got=${ISSUE}" >&2
+            exit 10
+          fi
+          echo "Inputs OK"
+
       - name: Download artifact "live-dev" from AI Debug run
         shell: bash
         env:
@@ -159,6 +176,34 @@ jobs:
           echo "To run manually, re-run with manual_override=true." >&2
           exit 90
 
+      - name: Init apply-audit (RUNNER_TEMP)
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          ISSUE: ${{ inputs.issue }}
+          RUN_ID: ${{ inputs.run_id }}
+          BASE: ${{ inputs.base_branch }}
+          OVERRIDE: ${{ inputs.manual_override }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/apply_audit"
+          {
+            echo "ts_utc=$(date -u +%FT%TZ)"
+            echo "workflow_run_id=${WORKFLOW_RUN_ID}"
+            echo "actor=${ACTOR}"
+            echo "manual_override=${OVERRIDE}"
+            echo "issue=${ISSUE}"
+            echo "ai_debug_run_id=${RUN_ID}"
+            echo "base_branch=${BASE}"
+            echo "digest="
+            echo "replay_skip="
+            echo "no_diff="
+            echo "result=pending"
+          } > "${RUNNER_TEMP}/apply_audit/audit.txt"
+          echo "Wrote audit:"
+          cat "${RUNNER_TEMP}/apply_audit/audit.txt"
+
       - name: Prepare artifact workspace (RUNNER_TEMP)
         shell: bash
         run: |
@@ -193,6 +238,12 @@ jobs:
 
           ROOT="${RUNNER_TEMP}/apply_ready"
           WANT="issue_${ISSUE}.md"
+
+          echo "QA contract (strict allowlist):"
+          echo " - ${ROOT}/_live_dev_norm/.ai/dev/${WANT}"
+          echo " - ${ROOT}/_live_dev_norm/request.json (optional)"
+          echo " - ${ROOT}/_live_dev_norm/response.json (optional)"
+          echo " - ${ROOT}/output/apply_digest.txt"
 
           BAD_FILES="$(find "$ROOT" -type f -print | sed 's|^\./||' | grep -Ev "^${ROOT}/(_live_dev_norm/\.ai/dev/${WANT}|_live_dev_norm/request\.json|_live_dev_norm/response\.json|output/apply_digest\.txt)$" || true)"
           if [ -n "$BAD_FILES" ]; then
@@ -245,11 +296,16 @@ jobs:
             exit 42
           fi
 
+          # Write digest into audit (best-effort)
+          sed -i "s/^digest=.*/digest=${CUR_DIG}/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+
           # GLOBAL replay guard in main tree (.ai/dev/applied_digests.txt)
           GLOBAL_FILE=".ai/dev/applied_digests.txt"
           if [ -f "$GLOBAL_FILE" ] && grep -Fxq "$CUR_DIG" "$GLOBAL_FILE"; then
             echo "Replay guard (GLOBAL): digest already applied -> skip (green)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            sed -i "s/^replay_skip=.*/replay_skip=true/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+            sed -i "s/^result=.*/result=skipped_replay/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
             exit 0
           fi
 
@@ -261,10 +317,13 @@ jobs:
             if [ -n "$PREV_DIG" ] && [ "$PREV_DIG" = "$CUR_DIG" ]; then
               echo "Replay guard (branch): same digest -> skip (green)"
               echo "skip=true" >> "$GITHUB_OUTPUT"
+              sed -i "s/^replay_skip=.*/replay_skip=true/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+              sed -i "s/^result=.*/result=skipped_replay/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
               exit 0
             fi
           fi
 
+          sed -i "s/^replay_skip=.*/replay_skip=false/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Stop early (replay-guard skip)
@@ -336,7 +395,12 @@ jobs:
 
       - name: Stop early (no diff)
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff == 'true' }}
-        run: echo "no-diff skip → green exit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "no-diff skip → green exit"
+          sed -i "s/^no_diff=.*/no_diff=true/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+          sed -i "s/^result=.*/result=skipped_no_diff/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
 
       - name: Allowlist guard (fail if changes outside allowed paths)
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
@@ -376,6 +440,9 @@ jobs:
           gh pr create --base "$BASE" --head "$BR" --title "$TITLE" --body "$BODY" 2>/dev/null || \
           gh pr edit "$BR" --title "$TITLE" --body "$BODY"
 
+          sed -i "s/^no_diff=.*/no_diff=false/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+          sed -i "s/^result=.*/result=pr_created/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
+
       - name: Label PR (ai-live)
         if: ${{ steps.replay.outputs.skip != 'true' && steps.nodiff.outputs.no_diff != 'true' }}
         shell: bash
@@ -400,6 +467,7 @@ jobs:
           MERGED_AT="$(gh pr view "$BR" --json mergedAt -q .mergedAt || true)"
           if [ -n "${MERGED_AT}" ] && [ "${MERGED_AT}" != "null" ]; then
             echo "PR already merged at ${MERGED_AT} -> ok"
+            sed -i "s/^result=.*/result=merged/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
             exit 0
           fi
 
@@ -410,6 +478,7 @@ jobs:
 
           if [ $RC -eq 0 ]; then
             echo "OK: auto-merge enabled"
+            sed -i "s/^result=.*/result=auto_merge_enabled/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
             exit 0
           fi
 
@@ -418,13 +487,24 @@ jobs:
 
           if [ -n "${MERGED_AT2}" ] && [ "${MERGED_AT2}" != "null" ]; then
             echo "PR got merged meanwhile -> ok"
+            sed -i "s/^result=.*/result=merged/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
             exit 0
           fi
 
           if [ "$AM_STATE" = "true" ]; then
             echo "Auto-merge already enabled -> ok"
+            sed -i "s/^result=.*/result=auto_merge_enabled/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
             exit 0
           fi
 
           echo "ERROR: failed to enable auto-merge (and it is not enabled)."
+          sed -i "s/^result=.*/result=error_auto_merge/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
           exit 1
+
+      - name: Upload apply-audit artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-audit
+          path: ${{ runner.temp }}/apply_audit/audit.txt
+          retention-days: 14
