@@ -31,6 +31,11 @@ on:
         required: true
         default: true
         type: boolean
+      manual_override:
+        description: "Allow manual Apply by a human (requires true). AUTO runs as github-actions[bot]."
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -124,6 +129,36 @@ jobs:
     environment: live-apply
 
     steps:
+      - name: E3 gate (AUTO-only unless manual_override=true)
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          OVERRIDE: ${{ inputs.manual_override }}
+        run: |
+          set -euo pipefail
+
+          norm_bool () {
+            v="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+            [ "$v" = "true" ] && echo "true" || echo "false"
+          }
+
+          OV="$(norm_bool "${OVERRIDE:-false}")"
+
+          if [ "${ACTOR}" = "github-actions[bot]" ]; then
+            echo "E3 gate: actor=github-actions[bot] (AUTO) -> OK"
+            exit 0
+          fi
+
+          if [ "$OV" = "true" ]; then
+            echo "E3 gate: manual_override=true by actor=${ACTOR} -> OK"
+            exit 0
+          fi
+
+          echo "ERROR: manual Apply blocked by E3 gate." >&2
+          echo "actor=${ACTOR}" >&2
+          echo "To run manually, re-run with manual_override=true." >&2
+          exit 90
+
       - name: Prepare artifact workspace (RUNNER_TEMP)
         shell: bash
         run: |
