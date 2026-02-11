@@ -51,6 +51,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
 
@@ -72,6 +73,7 @@ jobs:
             echo "ERROR: issue.json not found" >&2
             exit 21
           fi
+          test -s "$ISSUE_JSON"
 
           ISSUE="$(python3 -c 'import json,sys; p=sys.argv[1]; j=json.load(open(p,"r",encoding="utf-8")); v=j.get("number"); print("" if v is None else str(v))' "$ISSUE_JSON")"
           if ! echo "$ISSUE" | grep -Eq '^[0-9]+$'; then
@@ -101,11 +103,10 @@ jobs:
             REASON="apply"
           fi
 
-          export ISSUE APPLY_REQ ENABLED MODE SHOULD_TRIGGER REASON OWNER REPO RUN_ID
+          export ISSUE APPLY_REQ ENABLED MODE SHOULD_TRIGGER REASON OWNER REPO RUN_ID RUN_URL
 
-          python3 -c 'import json,os; out={"owner":os.environ.get("OWNER",""),"repo":os.environ.get("REPO",""),"ai_debug_run_id":os.environ.get("RUN_ID",""),"issue":os.environ.get("ISSUE",""),"apply_live_requested":(os.environ.get("APPLY_REQ","false")=="true"),"auto_apply_enabled_norm":os.environ.get("ENABLED","false"),"auto_apply_mode_norm":os.environ.get("MODE",""),"should_trigger_apply":(os.environ.get("SHOULD_TRIGGER","false")=="true"),"reason":os.environ.get("REASON","")}; f=open("_auto_out/decision.json","w",encoding="utf-8"); json.dump(out,f,ensure_ascii=False,indent=2); f.close()'
+          python3 -c 'import json,os; out={"owner":os.environ.get("OWNER",""),"repo":os.environ.get("REPO",""),"ai_debug_run_id":os.environ.get("RUN_ID",""),"ai_debug_run_url":os.environ.get("RUN_URL",""),"issue":os.environ.get("ISSUE",""),"apply_live_requested":(os.environ.get("APPLY_REQ","false")=="true"),"auto_apply_enabled_norm":os.environ.get("ENABLED","false"),"auto_apply_mode_norm":os.environ.get("MODE",""),"should_trigger_apply":(os.environ.get("SHOULD_TRIGGER","false")=="true"),"reason":os.environ.get("REASON","")}; f=open("_auto_out/decision.json","w",encoding="utf-8"); json.dump(out,f,ensure_ascii=False,indent=2); f.close()'
 
-          # STRICT check: decision.json must exist and be non-empty
           test -s _auto_out/decision.json
 
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
