@@ -124,27 +124,29 @@ jobs:
     environment: live-apply
 
     steps:
-      - name: Prepare workspace
+      - name: Prepare artifact workspace (RUNNER_TEMP)
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf apply_ready
-          mkdir -p apply_ready
+          echo "RUNNER_TEMP=${RUNNER_TEMP}"
+          rm -rf "${RUNNER_TEMP}/apply_ready"
+          mkdir -p "${RUNNER_TEMP}/apply_ready"
 
-      - name: Download apply-ready (from this workflow run)
+      - name: Download apply-ready (from this workflow run) to RUNNER_TEMP
         uses: actions/download-artifact@v4
         with:
           name: apply-ready
-          path: apply_ready
+          path: ${{ runner.temp }}/apply_ready
           run-id: ${{ github.run_id }}
 
-      - name: Assert apply-ready exists
+      - name: Assert apply-ready exists (RUNNER_TEMP)
         shell: bash
         run: |
           set -euo pipefail
-          echo "apply_ready tree:"
-          find apply_ready -type f -print
-          test -f "apply_ready/output/apply_digest.txt"
+          ROOT="${RUNNER_TEMP}/apply_ready"
+          echo "apply_ready tree (RUNNER_TEMP):"
+          find "$ROOT" -type f -print
+          test -f "$ROOT/output/apply_digest.txt"
 
       - name: QA gate (STRICT, ARTIFACT-ONLY, no git)
         if: ${{ inputs.qa_enabled == true }}
@@ -154,22 +156,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          ROOT="${RUNNER_TEMP}/apply_ready"
           WANT="issue_${ISSUE}.md"
 
-          BAD_FILES="$(find apply_ready -type f -print | sed 's|^\./||' | grep -Ev "^apply_ready/(_live_dev_norm/\.ai/dev/${WANT}|_live_dev_norm/request\.json|_live_dev_norm/response\.json|output/apply_digest\.txt)$" || true)"
+          BAD_FILES="$(find "$ROOT" -type f -print | sed 's|^\./||' | grep -Ev "^${ROOT}/(_live_dev_norm/\.ai/dev/${WANT}|_live_dev_norm/request\.json|_live_dev_norm/response\.json|output/apply_digest\.txt)$" || true)"
           if [ -n "$BAD_FILES" ]; then
             echo "ERROR: apply_ready contains files outside strict allowlist:" >&2
             echo "$BAD_FILES" >&2
             exit 71
           fi
 
-          test -s "apply_ready/_live_dev_norm/.ai/dev/${WANT}"
-          test -s "apply_ready/output/apply_digest.txt"
+          test -s "$ROOT/_live_dev_norm/.ai/dev/${WANT}"
+          test -s "$ROOT/output/apply_digest.txt"
 
-          D="$(cat apply_ready/output/apply_digest.txt | tr -d '\r' | head -n 1)"
+          D="$(cat "$ROOT/output/apply_digest.txt" | tr -d '\r' | head -n 1)"
           echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$'
 
-          for f in "apply_ready/_live_dev_norm/request.json" "apply_ready/_live_dev_norm/response.json"; do
+          for f in "$ROOT/_live_dev_norm/request.json" "$ROOT/_live_dev_norm/response.json"; do
             if [ -f "$f" ]; then
               python3 -c 'import json,sys; json.load(open(sys.argv[1],"r",encoding="utf-8"))' "$f"
               echo "OK JSON: $f"
@@ -183,7 +186,6 @@ jobs:
         with:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
-          clean: false
 
       - name: Replay guard (GLOBAL + branch) -> sets skip flag
         id: replay
@@ -193,10 +195,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          CUR_DIG_FILE="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
+          ROOT="${RUNNER_TEMP}/apply_ready"
+
+          CUR_DIG_FILE="$(find "$ROOT" -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
           if [ -z "$CUR_DIG_FILE" ]; then
             echo "ERROR: apply_ready/output/apply_digest.txt not found" >&2
-            find apply_ready -type f -print >&2
+            find "$ROOT" -type f -print >&2 || true
             exit 41
           fi
 
@@ -240,23 +244,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          ROOT="${RUNNER_TEMP}/apply_ready"
+
           WANT="issue_${ISSUE}.md"
-          SRC_MD="$(find apply_ready -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
+          SRC_MD="$(find "$ROOT" -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
           if [ -z "$SRC_MD" ]; then
             echo "ERROR: ${WANT} not found inside apply_ready" >&2
-            find apply_ready -type f -print >&2
+            find "$ROOT" -type f -print >&2 || true
             exit 31
           fi
 
-          SRC_DIG="$(find apply_ready -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
+          SRC_DIG="$(find "$ROOT" -type f -path "*/output/apply_digest.txt" | head -n 1 || true)"
           if [ -z "$SRC_DIG" ]; then
             echo "ERROR: output/apply_digest.txt not found inside apply_ready" >&2
-            find apply_ready -type f -print >&2
+            find "$ROOT" -type f -print >&2 || true
             exit 32
           fi
 
-          SRC_REQ="$(find apply_ready -type f -name "request.json" | head -n 1 || true)"
-          SRC_RESP="$(find apply_ready -type f -name "response.json" | head -n 1 || true)"
+          SRC_REQ="$(find "$ROOT" -type f -name "request.json" | head -n 1 || true)"
+          SRC_RESP="$(find "$ROOT" -type f -name "response.json" | head -n 1 || true)"
 
           mkdir -p .ai/dev output
           cp -f "$SRC_MD" ".ai/dev/${WANT}"
