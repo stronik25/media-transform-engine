@@ -183,6 +183,7 @@ jobs:
         with:
           ref: ${{ inputs.base_branch }}
           fetch-depth: 0
+          clean: false
 
       - name: Replay guard (GLOBAL + branch) -> sets skip flag
         id: replay
