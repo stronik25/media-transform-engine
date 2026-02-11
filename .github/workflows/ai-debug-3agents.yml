@@ -541,7 +541,6 @@ jobs:
           test -f "$OUT"
           test -s "$OUT"
 
-          # Also keep a copy next to request/response for convenience (optional)
           cp -f "$OUT" "output/live/dev/issue_${ISSUE_NUM}.md"
 
       - name: "Write apply_digest.txt (contract v1)"
@@ -621,27 +620,28 @@ jobs:
           fi
 
           python3 - <<'PY'
-import os, hmac, hashlib
-key = os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8")
-man_path = "output/live/dev/artifact_manifest.sha256"
-sig_path = "output/live/dev/artifact_signature.txt"
-meta_path = "output/live/dev/artifact_signature.meta"
+          import os, hmac, hashlib
 
-data = open(man_path,"rb").read()
-sig = hmac.new(key, data, hashlib.sha256).hexdigest()
+          key = os.environ.get("ARTIFACT_SIGNING_KEY", "").encode("utf-8")
+          man_path = "output/live/dev/artifact_manifest.sha256"
+          sig_path = "output/live/dev/artifact_signature.txt"
+          meta_path = "output/live/dev/artifact_signature.meta"
 
-open(sig_path,"w",encoding="utf-8",newline="\n").write(sig + "\n")
-open(meta_path,"w",encoding="utf-8",newline="\n").write(
-  "\n".join([
-    "version=1",
-    "algo=hmac-sha256",
-    "status=ok",
-    "signed=true",
-    "covers=artifact_manifest.sha256",
-  ]) + "\n"
-)
-print("OK: wrote artifact_signature.txt + meta")
-PY
+          data = open(man_path, "rb").read()
+          sig = hmac.new(key, data, hashlib.sha256).hexdigest()
+
+          open(sig_path, "w", encoding="utf-8").write(sig + "\n")
+          open(meta_path, "w", encoding="utf-8").write(
+            "\n".join([
+              "version=1",
+              "algo=hmac-sha256",
+              "status=ok",
+              "signed=true",
+              "covers=artifact_manifest.sha256",
+            ]) + "\n"
+          )
+          print("OK: wrote artifact_signature.txt + meta")
+          PY
 
       - name: "Upload LIVE DEV artifact (must include .ai/dev/issue_<N>.md)"
         uses: actions/upload-artifact@v4
