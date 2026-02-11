@@ -4,8 +4,8 @@
 URL: https://github.com/stronik25/media-transform-engine/issues/1
 
 ## Goal
-- Verify Clip Engine end-to-end functionality on the main branch after successful acceptance.
-- Confirm that outputs, artifacts, and meta fields produced by the Clip Engine are correct.
+- Verify the Clip Engine end-to-end functionality on the main branch after successful acceptance.
+- Confirm outputs, artifacts, and meta fields are correct after execution.
 - If verification is successful, propose the next concrete step.
 
 ## Current
@@ -17,7 +17,7 @@ URL: https://github.com/stronik25/media-transform-engine/issues/1
 - If everything is green, propose the next concrete step only.
 
 ## Repro
-1. Commit a valid input video (>30s) into input/video on main.
+1. Commit a valid input video (>30s) into `input/video` on main.
 2. Let Clip Engine workflow run automatically.
 
 ## Constraints
