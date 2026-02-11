@@ -352,6 +352,8 @@ jobs:
             echo "Signature enforcement: ON"
 
             SROOT="$ROOT/_live_dev_signed"
+            export SROOT
+
             test -f "$SROOT/.ai/dev/${WANT}" || { echo "ERROR: signed tree missing issue md" >&2; exit 72; }
             test -f "$SROOT/output/live/dev/request.json" || { echo "ERROR: signed tree missing request.json" >&2; exit 72; }
             test -f "$SROOT/output/live/dev/response.json" || { echo "ERROR: signed tree missing response.json" >&2; exit 72; }
@@ -377,15 +379,8 @@ jobs:
             # Verify manifest matches files (sha256sum -c)
             ( cd "$SROOT" && sha256sum -c "output/live/dev/artifact_manifest.sha256" )
 
-            # Verify HMAC(signature) over manifest bytes (NO HEREDOC -> no YAML "red")
-            SROOT="$SROOT" python3 -c 'import os,hmac,hashlib,sys; key=os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8"); root=os.environ.get("SROOT"); \
-              (root and True) or (print("ERROR: SROOT not provided to python",file=sys.stderr) or sys.exit(78)); \
-              man_path=os.path.join(root,"output","live","dev","artifact_manifest.sha256"); sig_path=os.path.join(root,"output","live","dev","artifact_signature.txt"); \
-              data=open(man_path,"rb").read(); expected=hmac.new(key,data,hashlib.sha256).hexdigest().lower(); \
-              got=open(sig_path,"r",encoding="utf-8").read().strip().splitlines()[0].strip().lower(); \
-              (hmac.compare_digest(expected,got) and True) or (print("ERROR: artifact signature mismatch",file=sys.stderr) or print("expected:",expected,file=sys.stderr) or print("got:     ",got,file=sys.stderr) or sys.exit(77)); \
-              print("OK: artifact signature verified")'
-
+            # Verify HMAC(signature) over manifest bytes (YAML-safe single line; no heredoc; no newlines)
+            python3 -c 'import os,hmac,hashlib,sys;key=os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8");root=os.environ["SROOT"];man_path=os.path.join(root,"output","live","dev","artifact_manifest.sha256");sig_path=os.path.join(root,"output","live","dev","artifact_signature.txt");data=open(man_path,"rb").read();expected=hmac.new(key,data,hashlib.sha256).hexdigest().lower();got=open(sig_path,"r",encoding="utf-8").read().strip().splitlines()[0].strip().lower();ok=hmac.compare_digest(expected,got);(print("OK: artifact signature verified") if ok else (print("ERROR: artifact signature mismatch",file=sys.stderr) or print("expected:",expected,file=sys.stderr) or print("got:     ",got,file=sys.stderr) or sys.exit(77)))'
           else
             echo "Signature enforcement: OFF"
           fi
