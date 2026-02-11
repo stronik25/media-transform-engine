@@ -17,13 +17,6 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-      - name: Install jq
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
       - name: Download AI Debug artifacts (context + preflight)
         shell: bash
         env:
@@ -80,7 +73,7 @@ jobs:
             exit 21
           fi
 
-          ISSUE="$(jq -r '.number // empty' "$ISSUE_JSON")"
+          ISSUE="$(python3 -c 'import json,sys; p=sys.argv[1]; j=json.load(open(p,"r",encoding="utf-8")); v=j.get("number"); print("" if v is None else str(v))' "$ISSUE_JSON")"
           if ! echo "$ISSUE" | grep -Eq '^[0-9]+$'; then
             echo "ERROR: invalid issue number: $ISSUE" >&2
             exit 22
@@ -108,27 +101,12 @@ jobs:
             REASON="apply"
           fi
 
-          jq -n \
-            --arg owner "$OWNER" \
-            --arg repo "$REPO" \
-            --arg ai_debug_run_id "$RUN_ID" \
-            --arg issue "$ISSUE" \
-            --arg auto_apply_enabled_norm "$ENABLED" \
-            --arg auto_apply_mode_norm "$MODE" \
-            --arg reason "$REASON" \
-            --argjson apply_live_requested "$( [ "$APPLY_REQ" = "true" ] && echo true || echo false )" \
-            --argjson should_trigger_apply "$( [ "$SHOULD_TRIGGER" = "true" ] && echo true || echo false )" \
-            '{
-              owner: $owner,
-              repo: $repo,
-              ai_debug_run_id: $ai_debug_run_id,
-              issue: $issue,
-              apply_live_requested: $apply_live_requested,
-              auto_apply_enabled_norm: $auto_apply_enabled_norm,
-              auto_apply_mode_norm: $auto_apply_mode_norm,
-              should_trigger_apply: $should_trigger_apply,
-              reason: $reason
-            }' > _auto_out/decision.json
+          export ISSUE APPLY_REQ ENABLED MODE SHOULD_TRIGGER REASON OWNER REPO RUN_ID
+
+          python3 -c 'import json,os; out={"owner":os.environ.get("OWNER",""),"repo":os.environ.get("REPO",""),"ai_debug_run_id":os.environ.get("RUN_ID",""),"issue":os.environ.get("ISSUE",""),"apply_live_requested":(os.environ.get("APPLY_REQ","false")=="true"),"auto_apply_enabled_norm":os.environ.get("ENABLED","false"),"auto_apply_mode_norm":os.environ.get("MODE",""),"should_trigger_apply":(os.environ.get("SHOULD_TRIGGER","false")=="true"),"reason":os.environ.get("REASON","")}; f=open("_auto_out/decision.json","w",encoding="utf-8"); json.dump(out,f,ensure_ascii=False,indent=2); f.close()'
+
+          # STRICT check: decision.json must exist and be non-empty
+          test -s _auto_out/decision.json
 
           echo "issue=$ISSUE" >> "$GITHUB_OUTPUT"
           echo "should_trigger=$SHOULD_TRIGGER" >> "$GITHUB_OUTPUT"
