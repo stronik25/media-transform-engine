@@ -37,9 +37,9 @@ on:
         default: false
         type: boolean
       enforce_artifact_signature:
-        description: "If true, require and verify artifact signature (supply-chain hardening). Default false to avoid breaking old runs."
+        description: "If true, require and verify artifact signature (supply-chain hardening)."
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -137,7 +137,6 @@ jobs:
           mkdir -p "_live_dev_signed/.ai/dev"
           mkdir -p "_live_dev_signed/output/live/dev"
 
-          # These are the paths that were signed in AI Debug step.
           SRC_MD2="$(find _live_dev_raw -type f -path "*/.ai/dev/${WANT}" | head -n 1 || true)"
           SRC_REQ2="$(find _live_dev_raw -type f -path "*/output/live/dev/request.json" | head -n 1 || true)"
           SRC_RESP2="$(find _live_dev_raw -type f -path "*/output/live/dev/response.json" | head -n 1 || true)"
@@ -148,7 +147,6 @@ jobs:
           [ -n "$SRC_RESP2" ] && cp -f "$SRC_RESP2" "_live_dev_signed/output/live/dev/response.json"
           [ -n "$SRC_DIG2" ] && cp -f "$SRC_DIG2" "_live_dev_signed/output/live/dev/apply_digest.txt"
 
-          # Signature / manifest files (optional if old run)
           SRC_MAN="$(find _live_dev_raw -type f -path "*/output/live/dev/artifact_manifest.sha256" | head -n 1 || true)"
           SRC_SIG="$(find _live_dev_raw -type f -path "*/output/live/dev/artifact_signature.txt" | head -n 1 || true)"
           SRC_META="$(find _live_dev_raw -type f -path "*/output/live/dev/artifact_signature.meta" | head -n 1 || true)"
@@ -286,14 +284,6 @@ jobs:
           ROOT="${RUNNER_TEMP}/apply_ready"
           WANT="issue_${ISSUE}.md"
 
-          echo "QA contract (strict allowlist):"
-          echo " - ${ROOT}/_live_dev_norm/.ai/dev/${WANT}"
-          echo " - ${ROOT}/_live_dev_norm/request.json (optional)"
-          echo " - ${ROOT}/_live_dev_norm/response.json (optional)"
-          echo " - ${ROOT}/output/apply_digest.txt"
-          echo " - ${ROOT}/_live_dev_signed/... (optional; required if enforce_artifact_signature=true)"
-
-          # Strict allowlist by exact paths
           ALLOWED=(
             "${ROOT}/_live_dev_norm/.ai/dev/${WANT}"
             "${ROOT}/_live_dev_norm/request.json"
@@ -347,7 +337,6 @@ jobs:
             fi
           done
 
-          # Signature enforcement (optional)
           if [ "$ENF" = "true" ]; then
             echo "Signature enforcement: ON"
 
@@ -363,24 +352,20 @@ jobs:
             test -f "$SROOT/output/live/dev/artifact_signature.txt" || { echo "ERROR: missing artifact_signature.txt" >&2; exit 73; }
             test -f "$SROOT/output/live/dev/artifact_signature.meta" || { echo "ERROR: missing artifact_signature.meta" >&2; exit 73; }
 
-            # Require signing key present
             if [ -z "${ARTIFACT_SIGNING_KEY:-}" ]; then
               echo "ERROR: enforce_artifact_signature=true but ARTIFACT_SIGNING_KEY secret is missing" >&2
               exit 74
             fi
 
-            # Meta must indicate signed=true + status=ok
             grep -Eq '^signed=true$' "$SROOT/output/live/dev/artifact_signature.meta" || { echo "ERROR: signature meta signed!=true" >&2; exit 75; }
             grep -Eq '^status=ok$' "$SROOT/output/live/dev/artifact_signature.meta" || { echo "ERROR: signature meta status!=ok" >&2; exit 75; }
 
             SIG="$(cat "$SROOT/output/live/dev/artifact_signature.txt" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | head -n 1)"
             echo "$SIG" | grep -Eq '^[0-9a-fA-F]{64}$' || { echo "ERROR: artifact_signature.txt invalid format" >&2; exit 76; }
 
-            # Verify manifest matches files (sha256sum -c)
             ( cd "$SROOT" && sha256sum -c "output/live/dev/artifact_manifest.sha256" )
 
-            # Verify HMAC(signature) over manifest bytes (YAML-safe single line; no heredoc; no newlines)
-            python3 -c 'import os,hmac,hashlib,sys;key=os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8");root=os.environ["SROOT"];man_path=os.path.join(root,"output","live","dev","artifact_manifest.sha256");sig_path=os.path.join(root,"output","live","dev","artifact_signature.txt");data=open(man_path,"rb").read();expected=hmac.new(key,data,hashlib.sha256).hexdigest().lower();got=open(sig_path,"r",encoding="utf-8").read().strip().splitlines()[0].strip().lower();ok=hmac.compare_digest(expected,got);(print("OK: artifact signature verified") if ok else (print("ERROR: artifact signature mismatch",file=sys.stderr) or print("expected:",expected,file=sys.stderr) or print("got:     ",got,file=sys.stderr) or sys.exit(77)))'
+            python3 -c 'import os,hmac,hashlib,sys; key=os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8"); root=os.environ.get("SROOT",""); assert root, "SROOT missing"; man_path=os.path.join(root,"output","live","dev","artifact_manifest.sha256"); sig_path=os.path.join(root,"output","live","dev","artifact_signature.txt"); data=open(man_path,"rb").read(); expected=hmac.new(key,data,hashlib.sha256).hexdigest().lower(); got=open(sig_path,"r",encoding="utf-8").read().strip().splitlines()[0].strip().lower(); ok=hmac.compare_digest(expected,got); (print("OK: artifact signature verified") if ok else (print("ERROR: artifact signature mismatch",file=sys.stderr) or print("expected:",expected,file=sys.stderr) or print("got:     ",got,file=sys.stderr) or sys.exit(77)))'
           else
             echo "Signature enforcement: OFF"
           fi
