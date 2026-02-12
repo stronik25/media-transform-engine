@@ -1,6 +1,6 @@
 name: "Apply LIVE DEV (by run_id)"
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       run_id:
@@ -182,6 +182,34 @@ jobs:
     environment: live-apply
 
     steps:
+      - name: Init apply-audit (RUNNER_TEMP)
+        shell: bash
+        env:
+          ACTOR: ${{ github.actor }}
+          ISSUE: ${{ inputs.issue }}
+          RUN_ID: ${{ inputs.run_id }}
+          BASE: ${{ inputs.base_branch }}
+          OVERRIDE: ${{ inputs.manual_override }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/apply_audit"
+          {
+            echo "ts_utc=$(date -u +%FT%TZ)"
+            echo "workflow_run_id=${WORKFLOW_RUN_ID}"
+            echo "actor=${ACTOR}"
+            echo "manual_override=${OVERRIDE}"
+            echo "issue=${ISSUE}"
+            echo "ai_debug_run_id=${RUN_ID}"
+            echo "base_branch=${BASE}"
+            echo "digest="
+            echo "replay_skip="
+            echo "no_diff="
+            echo "result=pending"
+          } > "${RUNNER_TEMP}/apply_audit/audit.txt"
+          echo "Wrote audit:"
+          cat "${RUNNER_TEMP}/apply_audit/audit.txt"
+
       - name: E3 gate (AUTO-only unless manual_override=true)
         shell: bash
         env:
@@ -210,35 +238,8 @@ jobs:
           echo "ERROR: manual Apply blocked by E3 gate." >&2
           echo "actor=${ACTOR}" >&2
           echo "To run manually, re-run with manual_override=true." >&2
+          sed -i "s/^result=.*/result=blocked_e3/" "${RUNNER_TEMP}/apply_audit/audit.txt" || true
           exit 90
-
-      - name: Init apply-audit (RUNNER_TEMP)
-        shell: bash
-        env:
-          ACTOR: ${{ github.actor }}
-          ISSUE: ${{ inputs.issue }}
-          RUN_ID: ${{ inputs.run_id }}
-          BASE: ${{ inputs.base_branch }}
-          OVERRIDE: ${{ inputs.manual_override }}
-          WORKFLOW_RUN_ID: ${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/apply_audit"
-          {
-            echo "ts_utc=$(date -u +%FT%TZ)"
-            echo "workflow_run_id=${WORKFLOW_RUN_ID}"
-            echo "actor=${ACTOR}"
-            echo "manual_override=${OVERRIDE}"
-            echo "issue=${ISSUE}"
-            echo "ai_debug_run_id=${RUN_ID}"
-            echo "base_branch=${BASE}"
-            echo "digest="
-            echo "replay_skip="
-            echo "no_diff="
-            echo "result=pending"
-          } > "${RUNNER_TEMP}/apply_audit/audit.txt"
-          echo "Wrote audit:"
-          cat "${RUNNER_TEMP}/apply_audit/audit.txt"
 
       - name: Prepare artifact workspace (RUNNER_TEMP)
         shell: bash
@@ -365,7 +366,23 @@ jobs:
 
             ( cd "$SROOT" && sha256sum -c "output/live/dev/artifact_manifest.sha256" )
 
-            python3 -c 'import os,hmac,hashlib,sys; key=os.environ.get("ARTIFACT_SIGNING_KEY","").encode("utf-8"); root=os.environ.get("SROOT",""); assert root, "SROOT missing"; man_path=os.path.join(root,"output","live","dev","artifact_manifest.sha256"); sig_path=os.path.join(root,"output","live","dev","artifact_signature.txt"); data=open(man_path,"rb").read(); expected=hmac.new(key,data,hashlib.sha256).hexdigest().lower(); got=open(sig_path,"r",encoding="utf-8").read().strip().splitlines()[0].strip().lower(); ok=hmac.compare_digest(expected,got); (print("OK: artifact signature verified") if ok else (print("ERROR: artifact signature mismatch",file=sys.stderr) or print("expected:",expected,file=sys.stderr) or print("got:     ",got,file=sys.stderr) or sys.exit(77)))'
+                        # HMAC verification without heredoc (safe for YAML)
+
+            MAN="$SROOT/output/live/dev/artifact_manifest.sha256"
+            SIGF="$SROOT/output/live/dev/artifact_signature.txt"
+
+            EXPECTED="$(openssl dgst -sha256 -hmac "$ARTIFACT_SIGNING_KEY" "$MAN" | awk '{print $2}' | tr '[:upper:]' '[:lower:]')"
+            GOT="$(cat "$SIGF" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+
+            if [ "$EXPECTED" != "$GOT" ]; then
+              echo "ERROR: artifact signature mismatch" >&2
+              echo "expected: $EXPECTED" >&2
+              echo "got:      $GOT" >&2
+              exit 77
+            fi
+
+            echo "OK: artifact signature verified"
+
           else
             echo "Signature enforcement: OFF"
           fi
