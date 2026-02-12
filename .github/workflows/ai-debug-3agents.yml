@@ -569,7 +569,7 @@ jobs:
           test -s "output/live/dev/apply_digest.txt"
           echo "OK: wrote apply_digest.txt sha256:${FINAL}"
 
-      - name: "Artifact signing (best-effort; no fail if key missing)"
+      - name: "Generate artifact manifest + signature (STRICT)"
         shell: bash
         env:
           ISSUE_NUM: ${{ needs.preflight.outputs.issue_num }}
@@ -577,6 +577,12 @@ jobs:
         run: |
           set -euo pipefail
           export LC_ALL=C
+
+          KEY="${ARTIFACT_SIGNING_KEY:-}"
+          if [ -z "$KEY" ]; then
+            echo "ERROR: ARTIFACT_SIGNING_KEY secret is missing. Add it to repo secrets." >&2
+            exit 78
+          fi
 
           WANT=".ai/dev/issue_${ISSUE_NUM}.md"
           REQ="output/live/dev/request.json"
@@ -595,53 +601,27 @@ jobs:
 
           : > "$MAN"
 
-          h1="$(sha256sum "$WANT" | awk '{print $1}')"
-          h2="$(sha256sum "$REQ" | awk '{print $1}')"
-          h3="$(sha256sum "$RESP" | awk '{print $1}')"
-          h4="$(sha256sum "$DIG" | awk '{print $1}')"
+          printf "%s  %s\n" "$(sha256sum "$WANT" | awk '{print $1}')" "$WANT" >> "$MAN"
+          printf "%s  %s\n" "$(sha256sum "$REQ"  | awk '{print $1}')" "$REQ"  >> "$MAN"
+          printf "%s  %s\n" "$(sha256sum "$RESP" | awk '{print $1}')" "$RESP" >> "$MAN"
+          printf "%s  %s\n" "$(sha256sum "$DIG"  | awk '{print $1}')" "$DIG"  >> "$MAN"
 
-          printf "%s  %s\n" "$h1" "$WANT" >> "$MAN"
-          printf "%s  %s\n" "$h2" "$REQ" >> "$MAN"
-          printf "%s  %s\n" "$h3" "$RESP" >> "$MAN"
-          printf "%s  %s\n" "$h4" "$DIG" >> "$MAN"
+          # Signature = HMAC-SHA256 over raw bytes of manifest file
+          openssl dgst -sha256 -hmac "$KEY" "$MAN" | awk '{print $2}' | tr '[:upper:]' '[:lower:]' > "$SIG"
+          echo >> "$SIG"
 
-          KEY="${ARTIFACT_SIGNING_KEY:-}"
-          if [ -z "$KEY" ]; then
-            printf "UNSIGNED\n" > "$SIG"
-            {
-              echo "version=1"
-              echo "algo=hmac-sha256"
-              echo "status=missing_key"
-              echo "signed=false"
-              echo "covers=artifact_manifest.sha256"
-            } > "$META"
-            echo "WARN: ARTIFACT_SIGNING_KEY not set -> wrote UNSIGNED signature files"
-            exit 0
-          fi
+          {
+            echo "version=1"
+            echo "algo=hmac-sha256"
+            echo "status=ok"
+            echo "signed=true"
+            echo "covers=artifact_manifest.sha256"
+          } > "$META"
 
-          python3 - <<'PY'
-          import os, hmac, hashlib
-
-          key = os.environ.get("ARTIFACT_SIGNING_KEY", "").encode("utf-8")
-          man_path = "output/live/dev/artifact_manifest.sha256"
-          sig_path = "output/live/dev/artifact_signature.txt"
-          meta_path = "output/live/dev/artifact_signature.meta"
-
-          data = open(man_path, "rb").read()
-          sig = hmac.new(key, data, hashlib.sha256).hexdigest()
-
-          open(sig_path, "w", encoding="utf-8").write(sig + "\n")
-          open(meta_path, "w", encoding="utf-8").write(
-            "\n".join([
-              "version=1",
-              "algo=hmac-sha256",
-              "status=ok",
-              "signed=true",
-              "covers=artifact_manifest.sha256",
-            ]) + "\n"
-          )
-          print("OK: wrote artifact_signature.txt + meta")
-          PY
+          test -s "$MAN"
+          test -s "$SIG"
+          test -s "$META"
+          echo "OK: wrote artifact_manifest.sha256 + signature + meta"
 
       - name: "Upload LIVE DEV artifact (must include .ai/dev/issue_<N>.md)"
         uses: actions/upload-artifact@v4
